@@ -533,3 +533,210 @@ std::visit([](auto&& arg) {
 
 QVariant 是 Qt 灵活性的重要体现，合理使用可以大大简化异构数据处理，但也要注意其性能成本和类型安全要求。
 
+## 4. 工程文件夹的保存
+针对 **工程文件夹** 的安全保存需求，我们需要改进方案以处理目录结构的完整性保护。以下是优化后的全流程解决方案：
+
+---
+
+### 4.1 解决方案：文件夹工程文件的安全保存协议
+
+#### 1. 空间检查阶段（预检避坑）
+```cpp
+bool checkDiskSpace(const QString& folderPath, qint64 requiredSize) {
+    QStorageInfo storage(folderPath);
+    return (storage.bytesAvailable() > requiredSize * 1.5); // 预留50%安全空间
+}
+
+// 计算文件夹大小（改进版）
+qint64 calculateFolderSize(const QString& path) {
+    qint64 total = 0;
+    QDirIterator it(path, QDir::Files | QDir::Hidden | QDir::NoSymLinks, QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        total += it.next().size();
+    }
+    return total;
+}
+```
+
+#### 2. 原子化保存流程（事务性操作）
+```mermaid
+sequenceDiagram
+    participant User
+    participant App
+    participant Filesystem
+    
+    User->>App: 点击保存
+    App->>Filesystem: 创建临时文件夹 (工程名.tmp)
+    App->>Filesystem: 写入新版本到.tmp
+    App->>Filesystem: 重命名原文件夹→.bak
+    App->>Filesystem: 重命名.tmp→正式文件夹
+    App->>Filesystem: 删除.bak
+    App->>User: 保存成功
+```
+
+#### 3. 关键实现代码
+```cpp
+bool safeSaveFolder(const QString& projectDir, const QString& tempContentDir) {
+    // 临时文件夹路径
+    QString tmpDir = projectDir + ".tmp";
+    QString bakDir = projectDir + ".bak";
+
+    // 1. 清空临时目录（如果存在）
+    QDir(tmpDir).removeRecursively();
+
+    // 2. 复制新内容到临时目录
+    if (!copyDirectory(tempContentDir, tmpDir)) {
+        QDir(tmpDir).removeRecursively();
+        return false;
+    }
+
+    // 3. 备份原目录
+    if (QDir(projectDir).exists() && !QDir().rename(projectDir, bakDir)) {
+        QDir(tmpDir).removeRecursively();
+        return false;
+    }
+
+    // 4. 原子替换
+    if (!QDir().rename(tmpDir, projectDir)) {
+        // 失败时回滚
+        if (QDir(bakDir).exists()) {
+            QDir().rename(bakDir, projectDir);
+        }
+        return false;
+    }
+
+    // 5. 清理备份
+    QDir(bakDir).removeRecursively();
+    return true;
+}
+
+// 跨平台目录复制
+bool copyDirectory(const QString& src, const QString& dst) {
+    QDir(src).mkdir(dst);
+    QFileInfoList entries = QDir(src).entryInfoList(QDir::NoDotAndDotDot | QDir::AllEntries);
+    for (const QFileInfo& item : entries) {
+        QString srcPath = item.filePath();
+        QString dstPath = dst + "/" + item.fileName();
+        if (item.isDir()) {
+            if (!copyDirectory(srcPath, dstPath)) return false;
+        } else {
+            if (!QFile::copy(srcPath, dstPath)) return false;
+        }
+    }
+    return true;
+}
+```
+
+#### 4. 崩溃恢复机制
+```cpp
+void checkRecovery(const QString& projectDir) {
+    QString bakDir = projectDir + ".bak";
+    QString tmpDir = projectDir + ".tmp";
+
+    // 情况1：存在.bak（主流程中断）
+    if (QDir(bakDir).exists()) {
+        if (QMessageBox::question(nullptr, "恢复", "检测到未完成的保存操作，是否恢复备份？") == QMessageBox::Yes) {
+            QDir(projectDir).removeRecursively();
+            QDir().rename(bakDir, projectDir);
+        }
+    }
+    // 情况2：存在.tmp（预保存阶段中断）
+    else if (QDir(tmpDir).exists()) {
+        QDir(tmpDir).removeRecursively();
+    }
+}
+```
+
+#### 5. 用户空间不足时的处理
+```cpp
+void handleLowDiskSpace(const QString& path) {
+    qint64 required = calculateFolderSize(app->tempProjectDir());
+    qint64 available = QStorageInfo(path).bytesAvailable();
+
+    QMessageBox msgBox;
+    msgBox.setText("磁盘空间不足");
+    msgBox.setInformativeText(
+        QString("需要 %1 MB，但只有 %2 MB 可用\n选择操作：")
+            .arg(required/1024/1024, 0, 'f', 1)
+            .arg(available/1024/1024, 0, 'f', 1));
+    
+    QPushButton* cleanButton = msgBox.addButton("清理磁盘", QMessageBox::ActionRole);
+    QPushButton* saveAsButton = msgBox.addButton("另存为...", QMessageBox::ActionRole);
+    msgBox.addButton(QMessageBox::Cancel);
+
+    msgBox.exec();
+
+    if (msgBox.clickedButton() == cleanButton) {
+        // 打开系统磁盘清理工具
+        QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+    } else if (msgBox.clickedButton() == saveAsButton) {
+        // 触发另存为逻辑
+        QString newPath = QFileDialog::getExistingDirectory();
+        if (!newPath.isEmpty()) saveToNewLocation(newPath);
+    }
+}
+```
+
+---
+
+### 4.2 增强保护措施
+
+1. **文件锁机制**：
+   ```cpp
+   // 保存期间锁定文件
+   QLockFile lockFile(projectDir + ".lock");
+   if (!lockFile.tryLock(1000)) {
+       QMessageBox::warning(nullptr, "警告", "工程正在被其他进程修改");
+       return;
+   }
+   ```
+
+2. **校验和验证**：
+   ```cpp
+   bool verifyFolderIntegrity(const QString& path) {
+       // 生成所有文件的MD5校验和
+       QMap<QString, QByteArray> checksums;
+       QDirIterator it(path, QDir::Files, QDirIterator::Subdirectories);
+       while (it.hasNext()) {
+           QFile f(it.next());
+           if (!f.open(QIODevice::ReadOnly)) return false;
+           checksums.insert(f.fileName(), QCryptographicHash::hash(f.readAll(), QCryptographicHash::Md5));
+       }
+       return !checksums.isEmpty();
+   }
+   ```
+
+3. **版本快照**：
+   ```cpp
+   void createVersionSnapshot(const QString& projectDir) {
+       QString versionDir = QString("%1/versions/v%2")
+                           .arg(QDir(projectDir).absolutePath())
+                           .arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"));
+       copyDirectory(projectDir, versionDir);
+   }
+   ```
+
+---
+
+### 4.3 最终保存流程图解
+```plaintext
+[开始保存]
+  │
+  ├─▶ [检查磁盘空间] → 不足 → 处理空间不足
+  │
+  ├─▶ [创建临时副本.tmp]
+  │     │
+  │     ├─▶ [写入所有新文件]
+  │     │
+  │     └─▶ [校验完整性] → 失败 → 删除.tmp并中止
+  │
+  ├─▶ [重命名原文件夹→.bak]
+  │
+  ├─▶ [重命名.tmp→正式文件夹]
+  │
+  └─▶ [删除.bak备份]
+        │
+        └─▶ [更新最近修改时间戳]
+```
+
+这种方案通过 **临时副本+原子替换+崩溃恢复** 三重保障，确保即使在高并发或意外断电情况下，工程文件夹要么完全保存成功，要么完整回退到之前的状态，从根本上避免了数据丢失风险。
