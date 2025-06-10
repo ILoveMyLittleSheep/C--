@@ -425,3 +425,144 @@ int main() {
    - 尝试提高波特率
    - 优化数据处理流程
    - 减少不必要的延时
+## 4. C++容器
+### 4.1 std::multimap 类型容器
+
+std::multimap 是 C++ STL 中的一个关联容器，它允许存储键值对，并且可以包含多个具有相同键的元素。
+
+#### 4.1.1 基本特性
+
+- 按键自动排序（默认升序）
+- 允许重复键
+- 基于红黑树实现，查找效率为 O(log n)
+- 元素类型为 std::pair<const Key, T>
+
+#### 4.1.2 创建和初始化
+
+```cpp
+#include <map>
+#include <string>
+
+// 创建一个空的 multimap
+std::multimap<int, std::string> mmap1;
+
+// 使用初始化列表创建
+std::multimap<int, std::string> mmap2 = {
+    {1, "apple"},
+    {2, "banana"},
+    {1, "apricot"},  // 允许重复键
+    {3, "cherry"}
+};
+```
+
+#### 4.1.3 插入元素
+
+```cpp
+// 使用 insert 方法
+mmap1.insert(std::make_pair(1, "apple"));
+mmap1.insert({2, "banana"});
+mmap1.emplace(1, "apricot");  // 使用 emplace 直接构造
+
+// 插入多个元素
+mmap1.insert({{3, "cherry"}, {2, "blueberry"}, {1, "avocado"}});
+```
+
+#### 4.1.4 访问元素
+
+```cpp
+// 遍历所有元素
+for (const auto& pair : mmap1) {
+    std::cout << pair.first << ": " << pair.second << std::endl;
+}
+
+// 查找特定键的所有元素
+auto range = mmap1.equal_range(1);
+for (auto it = range.first; it != range.second; ++it) {
+    std::cout << "Found: " << it->second << std::endl;
+}
+
+// 检查键是否存在
+if (mmap1.find(2) != mmap1.end()) {
+    std::cout << "Key 2 exists" << std::endl;
+}
+```
+
+#### 4.1.5 删除元素
+
+```cpp
+// 删除特定键的所有元素
+size_t num_erased = mmap1.erase(1);
+
+// 删除单个元素
+auto it = mmap1.find(2);
+if (it != mmap1.end()) {
+    mmap1.erase(it);
+}
+
+// 删除一定范围内的元素
+auto first = mmap1.lower_bound(2);
+auto last = mmap1.upper_bound(3);
+mmap1.erase(first, last);
+```
+
+#### 4.1.6 其他常用操作
+
+```cpp
+// 获取容器大小
+std::cout << "Size: " << mmap1.size() << std::endl;
+
+// 检查是否为空
+if (mmap1.empty()) {
+    std::cout << "Multimap is empty" << std::endl;
+}
+
+// 获取键比较函数
+auto cmp = mmap1.key_comp();
+
+// 清空容器
+mmap1.clear();
+```
+
+#### 4.1.7 自定义比较函数
+
+```cpp
+// 自定义比较函数
+struct CaseInsensitiveCompare {
+    bool operator()(const std::string& a, const std::string& b) const {
+        return std::lexicographical_compare(
+            a.begin(), a.end(),
+            b.begin(), b.end(),
+            [](char c1, char c2) { return tolower(c1) < tolower(c2); }
+        );
+    }
+};
+
+// 使用自定义比较函数的 multimap
+std::multimap<std::string, int, CaseInsensitiveCompare> case_insensitive_map;
+```
+
+#### 4.1.8 性能考虑
+
+- 插入和删除操作：O(log n)
+- 查找操作：O(log n)
+- 遍历操作：O(n)
+- 如果需要更快的查找但可以接受稍慢的插入，考虑使用 std::unordered_multimap
+
+#### 4.1.9 实际应用示例
+
+```cpp
+// 电话簿示例 - 一个人可能有多个电话号码
+std::multimap<std::string, std::string> phonebook;
+
+phonebook.insert({"John", "123-4567"});
+phonebook.insert({"John", "765-4321"});
+phonebook.insert({"Alice", "555-1234"});
+
+// 查找 John 的所有电话号码
+auto john_numbers = phonebook.equal_range("John");
+for (auto it = john_numbers.first; it != john_numbers.second; ++it) {
+    std::cout << it->second << std::endl;
+}
+```
+
+std::multimap 在需要维护键值对并且允许键重复的场景下非常有用，如索引、反向映射等。
