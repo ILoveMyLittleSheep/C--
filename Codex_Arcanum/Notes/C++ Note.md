@@ -426,143 +426,193 @@ int main() {
    - 优化数据处理流程
    - 减少不必要的延时
 ## 4. C++容器
-### 4.1 std::multimap 类型容器
+### 4.1 std::multimap 的存储特性和方法
 
-std::multimap 是 C++ STL 中的一个关联容器，它允许存储键值对，并且可以包含多个具有相同键的元素。
+std::multimap 是 C++ 标准模板库(STL)中的一个关联容器，它允许存储键值对(key-value pairs)，并且支持多个元素拥有相同的键。下面我将详细解析它的存储特性和方法。
 
-#### 4.1.1 基本特性
+#### 4.1.1 存储特性
 
-- 按键自动排序（默认升序）
-- 允许重复键
-- 基于红黑树实现，查找效率为 O(log n)
-- 元素类型为 std::pair<const Key, T>
+**1. 底层数据结构**
+- **基于红黑树**实现，是一种自平衡的二叉搜索树
+- 保持元素按键排序的状态
+- 插入、删除和查找操作的时间复杂度均为 O(log n)
 
-#### 4.1.2 创建和初始化
+**2. 排序特性**
+- 元素**自动按键排序**（默认升序）
+- 排序依据可以通过比较函数对象自定义
+- 排序是在插入时自动完成的
+
+**3. 键的特性**
+- **允许重复键**（与 std::map 的主要区别）
+- 键是 const 的，不能直接修改
+- 要修改键，必须先删除再重新插入
+
+**4. 内存布局**
+- 元素以节点形式存储
+- 每个节点包含键、值和指向子节点的指针
+- 不是连续内存存储，迭代器失效规则与 std::map 相同
+
+#### 4.1.2 主要方法解析
+
+**1. 构造与赋值**
+```cpp
+// 默认构造函数
+std::multimap<int, std::string> mmap1;
+
+// 范围构造函数
+std::multimap<int, std::string> mmap2(begin, end);
+
+// 拷贝构造函数
+std::multimap<int, std::string> mmap3(mmap1);
+
+// 移动构造函数
+std::multimap<int, std::string> mmap4(std::move(mmap1));
+
+// 初始化列表构造
+std::multimap<int, std::string> mmap5 = {{1,"a"}, {2,"b"}, {1,"c"}};
+```
+
+**2. 元素访问**
+```cpp
+// 查找键为key的所有元素 - 返回迭代器范围
+auto range = mmap.equal_range(key);
+
+// 查找第一个不小于key的元素
+auto lower = mmap.lower_bound(key);
+
+// 查找第一个大于key的元素
+auto upper = mmap.upper_bound(key);
+
+// 检查键是否存在
+bool exists = mmap.count(key) > 0;
+```
+
+**3. 元素操作**
+```cpp
+// 插入元素
+mmap.insert({key, value});
+mmap.emplace(key, value);  // 原地构造
+
+// 删除元素
+mmap.erase(key);           // 删除所有键为key的元素
+mmap.erase(iterator);      // 删除指定位置的元素
+mmap.erase(first, last);   // 删除范围[first,last)内的元素
+
+// 提取节点(C++17)
+auto node = mmap.extract(iterator);
+```
+
+**4. 容量查询**
+```cpp
+bool empty = mmap.empty();  // 是否为空
+size_t size = mmap.size();  // 元素数量
+size_t max = mmap.max_size(); // 最大可能容量
+```
+
+**5. 迭代器**
+```cpp
+// 获取迭代器
+auto begin = mmap.begin();
+auto end = mmap.end();
+auto rbegin = mmap.rbegin(); // 反向迭代器
+auto rend = mmap.rend();
+
+// 常量迭代器
+auto cbegin = mmap.cbegin();
+auto cend = mmap.cend();
+```
+
+**6. 比较操作**
+```cpp
+// 获取比较函数对象
+auto comp = mmap.key_comp();
+auto value_comp = mmap.value_comp();
+
+// 比较两个multimap
+bool equal = (mmap1 == mmap2);
+bool less = (mmap1 < mmap2);
+```
+
+#### 4.1.3 特殊方法
+
+##### 1. merge (C++17)
+```cpp
+std::multimap<int, std::string> mmap1, mmap2;
+// 将mmap2中的元素合并到mmap1中
+mmap1.merge(mmap2);
+```
+
+##### 2. extract (C++17)
+```cpp
+// 从multimap中提取节点
+auto node = mmap.extract(iterator);
+// 修改节点的键
+node.key() = new_key;
+// 将节点重新插入
+mmap.insert(std::move(node));
+```
+
+#### 4.1.3 性能特点
+
+1. **插入性能**
+   - 平均情况：O(log n)
+   - 最坏情况：O(log n) (红黑树保持平衡)
+
+2. **查找性能**
+   - equal_range: O(log n)
+   - find: O(log n)
+   - count: O(log n + m) (m为相同键的元素数量)
+
+3. **删除性能**
+   - 按键删除：O(log n + m)
+   - 按迭代器删除：分摊O(1)
+
+4. **空间开销**
+   - 每个元素需要额外存储颜色信息和三个指针
+   - 内存不连续，可能有较高的内存开销
+
+#### 4.1.4 使用场景
+
+1. 需要维护有序键值对的集合
+2. 允许键重复的情况
+3. 需要频繁按键查找、范围查询
+4. 需要按排序顺序遍历元素
+
+#### 4.1.5 示例代码
 
 ```cpp
 #include <map>
 #include <string>
+#include <iostream>
 
-// 创建一个空的 multimap
-std::multimap<int, std::string> mmap1;
-
-// 使用初始化列表创建
-std::multimap<int, std::string> mmap2 = {
-    {1, "apple"},
-    {2, "banana"},
-    {1, "apricot"},  // 允许重复键
-    {3, "cherry"}
-};
-```
-
-#### 4.1.3 插入元素
-
-```cpp
-// 使用 insert 方法
-mmap1.insert(std::make_pair(1, "apple"));
-mmap1.insert({2, "banana"});
-mmap1.emplace(1, "apricot");  // 使用 emplace 直接构造
-
-// 插入多个元素
-mmap1.insert({{3, "cherry"}, {2, "blueberry"}, {1, "avocado"}});
-```
-
-#### 4.1.4 访问元素
-
-```cpp
-// 遍历所有元素
-for (const auto& pair : mmap1) {
-    std::cout << pair.first << ": " << pair.second << std::endl;
-}
-
-// 查找特定键的所有元素
-auto range = mmap1.equal_range(1);
-for (auto it = range.first; it != range.second; ++it) {
-    std::cout << "Found: " << it->second << std::endl;
-}
-
-// 检查键是否存在
-if (mmap1.find(2) != mmap1.end()) {
-    std::cout << "Key 2 exists" << std::endl;
-}
-```
-
-#### 4.1.5 删除元素
-
-```cpp
-// 删除特定键的所有元素
-size_t num_erased = mmap1.erase(1);
-
-// 删除单个元素
-auto it = mmap1.find(2);
-if (it != mmap1.end()) {
-    mmap1.erase(it);
-}
-
-// 删除一定范围内的元素
-auto first = mmap1.lower_bound(2);
-auto last = mmap1.upper_bound(3);
-mmap1.erase(first, last);
-```
-
-#### 4.1.6 其他常用操作
-
-```cpp
-// 获取容器大小
-std::cout << "Size: " << mmap1.size() << std::endl;
-
-// 检查是否为空
-if (mmap1.empty()) {
-    std::cout << "Multimap is empty" << std::endl;
-}
-
-// 获取键比较函数
-auto cmp = mmap1.key_comp();
-
-// 清空容器
-mmap1.clear();
-```
-
-#### 4.1.7 自定义比较函数
-
-```cpp
-// 自定义比较函数
-struct CaseInsensitiveCompare {
-    bool operator()(const std::string& a, const std::string& b) const {
-        return std::lexicographical_compare(
-            a.begin(), a.end(),
-            b.begin(), b.end(),
-            [](char c1, char c2) { return tolower(c1) < tolower(c2); }
-        );
+int main() {
+    std::multimap<int, std::string> inventory;
+    
+    // 插入元素
+    inventory.insert({3, "apple"});
+    inventory.insert({1, "banana"});
+    inventory.insert({3, "orange"});
+    inventory.insert({2, "grape"});
+    inventory.insert({1, "pear"});
+    
+    // 遍历所有元素(按键排序)
+    std::cout << "All items:\n";
+    for (const auto& [key, value] : inventory) {
+        std::cout << key << ": " << value << "\n";
     }
-};
-
-// 使用自定义比较函数的 multimap
-std::multimap<std::string, int, CaseInsensitiveCompare> case_insensitive_map;
-```
-
-#### 4.1.8 性能考虑
-
-- 插入和删除操作：O(log n)
-- 查找操作：O(log n)
-- 遍历操作：O(n)
-- 如果需要更快的查找但可以接受稍慢的插入，考虑使用 std::unordered_multimap
-
-#### 4.1.9 实际应用示例
-
-```cpp
-// 电话簿示例 - 一个人可能有多个电话号码
-std::multimap<std::string, std::string> phonebook;
-
-phonebook.insert({"John", "123-4567"});
-phonebook.insert({"John", "765-4321"});
-phonebook.insert({"Alice", "555-1234"});
-
-// 查找 John 的所有电话号码
-auto john_numbers = phonebook.equal_range("John");
-for (auto it = john_numbers.first; it != john_numbers.second; ++it) {
-    std::cout << it->second << std::endl;
+    
+    // 查找所有键为3的元素
+    std::cout << "\nItems with key 3:\n";
+    auto range = inventory.equal_range(3);
+    for (auto it = range.first; it != range.second; ++it) {
+        std::cout << it->first << ": " << it->second << "\n";
+    }
+    
+    // 删除所有键为1的元素
+    inventory.erase(1);
+    
+    return 0;
 }
 ```
 
-std::multimap 在需要维护键值对并且允许键重复的场景下非常有用，如索引、反向映射等。
+std::multimap 是一个功能强大的容器，特别适合需要处理有序且允许键重复的键值对集合的场景。理解它的存储特性和方法可以帮助你更有效地使用它。
