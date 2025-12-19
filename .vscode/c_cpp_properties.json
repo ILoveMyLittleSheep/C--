@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "${workspaceFolder}/**"
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE"
+            ],
+            "compilerPath": "D:\\Qt\\Qt5.14.2\\Tools\\QtCreator\\bin\\clang\\bin\\clang-cl.exe"
+        }
+    ],
+    "version": 4
+}

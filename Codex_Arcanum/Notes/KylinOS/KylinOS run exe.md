@@ -386,7 +386,12 @@
     cd build
     
     # 配置编译选项
-    cmake .. -DARM_DYNAREC=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    cmake .. \
+    -DARM_DYNAREC=ON \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DDOWNLOAD_LIBS=ON \
+    -DDOWNLOAD_X64LIBS=ON \
+    -DDOWNLOAD_WRAPPEDLIBS=ON  # 下载完整的库
     
     # 开始编译（根据CPU核心数调整-j参数）
     make -j4
@@ -406,6 +411,9 @@
     
     # 设置box64为默认的x86_64解释器
     sudo systemctl daemon-reload
+
+    #创建符号链接
+    sudo ln -sf /home/user/box64/build/box64 /usr/local/bin/box64
     ```
 
   - 检查Box64安装
@@ -423,6 +431,31 @@
     >   - 由Wine开发者或社区维护者预先编译好
     >   - 针对x86_64架构编译 
 
+    注意：如果遇到`Error loading needed lib libgcc_s.so.1`问题，需要检查 box64 的库包装情况。
+    ```linux
+    find ~/box64 -name "*libgcc*" -type f 2>/dev/null
+    ```
+    如果可以检查到`libgcc_s.so.1`文件，说明 box64 自带了 x86_64 的库，但 Wine 没有找到它们，需要告诉 box64 使用这些库。
+    ```linux
+    # 创建 box64 配置文件目录
+    mkdir -p ~/.config/box64
+
+    # 创建配置文件
+    cat > ~/.config/box64/box64.conf << 'EOF'
+    # Box64 配置文件
+    BOX64_LD_LIBRARY_PATH=/home/user/box64/x64lib:/home/user/box64/x86lib:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu
+    BOX64_PATH=/usr/bin:/bin:/usr/local/bin
+    BOX64_DYNAREC=1
+    BOX64_LOG=0
+    # 可选：禁用某些模块以提升兼容性
+    BOX64_NOPULSE=1
+    BOX64_NOGTK=1
+    EOF
+
+    # 添加到 bashrc，让环境变量生效
+    echo 'export BOX64_LD_LIBRARY_PATH="/home/user/box64/x64lib:/home/user/box64/x86lib:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu"' >> ~/.bashrc
+    source ~/.bashrc
+    ```
     ```linux
     cd ~
     # 下载专为box64优化的Wine构建
@@ -1633,22 +1666,402 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 
 ## 2.4 DLL包装器实现
 
-1. 创建开发目录
+1. **技术路线**
 
-  ```
-mkdir -p ~/dll_wrappers
-cd ~/dll_wrappers
-  ```
+    *文件结构：*
+    ```text
+    项目目录/
+    ├── sdk/
+    │   └── x64/                    # x64版华睿SDK（用于Box64翻译）
+    │       ├── libMVSDK_x64.so     # x64 Linux库
+    │       ├── IMVApi.h
+    │       └── IMVDefines.h
+    ├── src/
+    │   ├── UnixMV_x64.h           # x64版Unix接口（重新编译为x64库）
+    │   ├── UnixMV_x64.cpp         # 调用x64 SDK（通过Box64运行）
+    │   ├── WrapMV.h               # Windows接口
+    │   └── WrapMV.c               # Windows DLL（静态链接UnixMV_x64库）
+    ├── build/
+    │   ├── libUnixMV_x64.so       # x64 Linux库（通过linux gcc x64编译）
+    │   └── WrapMV.dll             # x64 Windows DLL（通过winegcc编译）
+    └── 编译脚本/
+    ```
+    *数据流图*
+    ```text
+      [Windows App]          [Wine x64]          [Box64]          [Linux x64]         [ARM64 CPU]
+        │                      │                   │                  │                   │
+        │ 调用WRAP_IMV_GetFrame│                   │                  │                   │
+        ├─────────────────────>│                   │                  │                   │
+        │                      │ PE到ELF转换       │                  │                   │
+        │                      ├──────────────────>│                  │                   │
+        │                      │                   │ ABI翻译          │                   │
+        │                      │                   ├─────────────────>│                  │
+        │                      │                   │                  │ 调用UNIX_IMV_GetFrame│
+        │                      │                   │                  ├──────────────────>│
+        │                      │                   │                  │                  │ ARM64执行
+        │                      │                   │                  │<──────────────────│
+        │                      │                   │<─────────────────│                  │
+        │                      │<──────────────────│                  │                   │
+        │<─────────────────────│                   │                  │                   │
+        │  返回结果             │                   │                  │                   │
+    ```
+    *完整执行链*
+    ```
+    ARM64 CPU
+        ↓
+    box64 (指令翻译)
+        ↓
+    x86_64-linux-gnu-g++ (编译 UnixMV.so)
+        ↓
+    box64 (指令翻译)
+        ↓
+    winegcc (编译 WrapMV.dll)
+        ↓
+    最终：libUnixMV.so (x64 Linux ELF) + WrapMV.dll (x64 Windows PE)
+    ```
 
-2. 分析现有DLL函数
+2. **安装linux x64 gcc编译器**
+    
+    由于本次使用的麒麟系统是ARM架构，因此x64 gcc编译器需要自行下载，最方便的是使用预构建的完整工具链
+    ```
+    # 回到主目录
+    cd ~
 
-  ```
-# 从现有DLL提取函数名（如果有的话）
-cd "/home/user/.wine-xtom/drive_c/Program Files/XTOM"
-for dll in MVSDKmd.dll GxIAPI.dll CAMCTRL_64.dll; do
-    if [ -f "$dll" ]; then
-        echo "=== $dll 导出函数 ==="
-        strings "$dll" | grep -E "^(MV_|GX_|CAM_)" | head -10
+    # 下载完整的 x86_64 交叉编译器（专门为 ARM 主机构建）
+    wget https://toolchains.bootlin.com/downloads/releases/toolchains/x86-64/tarballs/x86-64--glibc--stable-2022.08-1.tar.bz2
+
+    # 解压
+    tar xf x86-64--glibc--stable-2022.08-1.tar.bz2
+
+    # 进入目录并测试
+    cd x86-64--glibc--stable-2022.08-1
+    ./bin/x86_64-linux-gcc --version
+    ```
+    
+3. **winegcc问题处理**
+
+    直接使用`~/wine-x64/wine-10.17-amd64/bin/winegcc --version`会发现错误`winegcc: Could not find gcc`，这意味着winegcc没有找到 x86_64 版本的 gcc，虽然我们已经设置了交叉编译器，但 winegcc 可能没有正确找到它。
+    设置正确的环境变量重新尝试，依旧报错，尝试跟踪指令输出
+    ```linux
+    ~/wine-x64/wine-10.17-amd64/bin$ strace -f -e execve,execveat box64 ./winegcc --version 2>&1 | grep -E 'exec.*gcc|"gcc"|gcc-11'
+    ```
+    错误信息提示
+    ```linux
+    newfstatat(AT_FDCWD, "/usr/bin/gcc-11", ...) = -1 ENOENT (没有那个文件或目录)
+    ```
+    这意味着winegcc 在查找 gcc-11(硬编码，设置环境变量无效)，所以我们需要创建 /usr/bin/gcc-11 g++-11 包装器
+    ```linux
+    sudo ln -sf /home/user/x86-64--glibc--stable-2022.08-1/bin/x86_64-linux-gcc-11.3.0.br_real /usr/bin/gcc-11
+    sudo ln -sf /home/user/x86-64--glibc--stable-2022.08-1/bin/x86_64-linux-g++.br_real /usr/bin/g++-11
+
+    # 测试
+    cd ~/wine-x64/wine-10.17-amd64/bin
+    box64 ./winegcc --version
+    ```
+    **这里考虑，为什么Wine 为什么需要外部编译器？**
+
+    原因：
+    - Wine 不是编译器 - Wine 是一个兼容层/转换层，不是编译器
+    - winegcc/wineg++ 是包装器 - 它们只是 GNU GCC 的包装器
+    - 作用：
+      - 设置正确的 Wine 特定标志
+      - 链接 Wine 的库（如 libwine）
+      - 处理 Windows 特定的调用约定
+      - 但实际的编译工作还是交给 GCC
+
+    winegcc 的工作流程
+    ```text
+    winegcc → 调用系统 GCC → 编译代码 → 链接 Wine 库 → 生成 Windows PE 文件
+        ↑
+      (包装器)
+    ```
+    对于本次问题，情况特殊在于：
+
+    **主机:** ARM64（飞腾处理器）
+
+    **目标:** x86_64 Windows
+
+    **工具链:** x86_64 GCC（通过 Box64 运行）
+
+    这就是为什么我们需要：
+
+    x86_64 的 GCC（用于编译 x86_64 代码）
+
+    Box64（在 ARM 上运行 x86_64 的 GCC）
+
+    包装器脚本（让 winegcc 能找到正确的编译器）
+
+    **解决完winegcc问题后，在编译WrapMV.dll过程中，遇到新的问题**
+    ```text
+    /usr/bin/ld: 无法辨认的仿真模式: elf_x86_64
+    支持的仿真： aarch64linux aarch64elf aarch64elf32 aarch64elf32b aarch64elfb armelf armelfb aarch64linuxb aarch64linux32 aarch64linux32b armelfb_linux_eabi armelf_linux_eabi
+    winebuild: /usr/bin/ld failed with status 1
+    winegcc: /home/user/wine-x64/wine-10.17-amd64/bin/winebuild failed
+    ```
+    这里分析winegcc的工作原理
+    ```text
+    winegcc
+    ├── 调用 gcc (x86_64 版本) 编译 C 代码为 .o 文件
+    ├── 调用 winebuild 处理 Windows 特定的部分
+    └── 调用 ld (x86_64 版本) 链接成 .dll
+    ```
+    这是链接器架构不匹配的问题，winegcc 在链接阶段调用了系统默认的 ld（ARM64 版本），而不是 x86_64 版本的 ld，解决方法：创建系统级包装器（覆盖系统 ld），但是要注意对原文件的备份。
+    
+    分析原ld文件，发现只是ARM64编译器ld文件的快捷方式。
+    ```linux
+    readlink /usr/bin/ld
+    # 执行结果： /usr/bin/aarch64-linux-gnu-ld.bfd
+    ```
+
+    **`替换符号链接后一定要记得恢复，否则会导致ARM系统的编译器连接错误！！！`**
+    ```linux
+    # 直接替换符号链接
+    sudo ln -sf "/home/user/x86-64--glibc--stable-2022.08-1/bin/x86_64-buildroot-linux-gnu-ld" /usr/bin/ld
+
+    # 恢复原状，原本的ld文件就是链接的aarch64-linux-gnu-ld.bfd文件
+    sudo ln -sf /usr/bin/aarch64-linux-gnu-ld.bfd /usr/bin/ld
+    ```
+    **至此，winegcc和linux x64 gcc编译器的问题全部解决，接下来可以对包装类进行编译。**
+4. **编译包装类**
+
+    使用以下脚本，编译代码生成库文件:
+    libUnixMV.so  (Linux x86-64 共享库)
+    WrapMV.dll.so
+    WrapMV.dll    (Windows x86-64 DLL)
+    ```linux
+    #!/bin/bash
+    set -e  # 出错时退出
+
+    # ========== 配置区域 ==========
+    PROJECT_DIR=$(pwd)
+    BUILD_DIR="$PROJECT_DIR/build"
+    SRC_DIR="$PROJECT_DIR/src"
+    SDK_DIR="$PROJECT_DIR/sdk/x64"
+
+    # 工具路径
+    BOXPATH="box64"  # box64已在PATH中
+    WINEGCC="/home/user/wine/wine-10.17-amd64/bin/winegcc"
+
+    # x86_64 工具链
+    X64_BASE="/home/user/x86-64--glibc--stable-2022.08-1/bin"
+    X64_GCC="$X64_BASE/x86_64-linux-gcc"
+    X64_GXX="$X64_BASE/x86_64-linux-g++"
+    # ==============================
+
+    # 设置正确的链接器
+    echo "=== 1. 替换系统 ld ==="
+    echo "当前系统 ld: $(ls -l /usr/bin/ld 2>/dev/null || echo '不存在')"
+
+    sudo ln -sf "/home/user/x86-64--glibc--stable-2022.08-1/bin/x86_64-buildroot-linux-gnu-ld" /usr/bin/ld
+
+    echo "=========================================="
+    echo "    WrapMV 跨平台编译脚本 (ARM64 → x86-64)"
+    echo "=========================================="
+
+    echo "=== 2. 清理构建目录 ==="
+    rm -rf "$BUILD_DIR"
+    mkdir -p "$BUILD_DIR"
+
+    echo "=== 3. 编译 UnixMV.so (x86-64 Linux 共享库) ==="
+    echo "使用: $X64_GXX"
+
+    UNIX_LOG="$BUILD_DIR/unixmv_compile.log"
+    $BOXPATH $X64_GXX -shared -fPIC -std=c++11 -m64 \
+        -o "$BUILD_DIR/libUnixMV.so" \
+        "$SRC_DIR/UnixMV.cpp" \
+        -I"$SRC_DIR" \
+        -I"$SDK_DIR" \
+        -L"$SDK_DIR" -lMVSDK \
+      -L/home/user/x86-64--glibc--stable-2022.08-1/lib -lgmp \
+        -Wl,-rpath,/home/user/x86-64--glibc--stable-2022.08-1/lib \
+        -ldl -lpthread\
+      2>&1 | tee "$UNIX_LOG"
+
+    echo "   -> 验证: $(file "$BUILD_DIR/libUnixMV.so" | cut -d: -f2-)"
+    echo "   -> 大小: $(ls -lh "$BUILD_DIR/libUnixMV.so" | awk '{print $5}')"
+
+    echo "=== 4. 编译 WrapMV.dll (x86-64 Windows DLL) ==="
+    echo "使用: winegcc (通过 box64)"
+
+    WRAP_LOG="$BUILD_DIR/wrapmv_compile.log"
+    $BOXPATH $WINEGCC -shared -m64 \
+        -o "$BUILD_DIR/WrapMV.dll.so" \
+        "$SRC_DIR/WrapMV.c" \
+        "$SRC_DIR/WrapMV.def" \
+        -I"$SRC_DIR" \
+        -L"$BUILD_DIR" -lUnixMV \
+        -L"$SDK_DIR" -lMVSDK\
+      -ldl -lpthread
+      2>&1 | tee "$WRAP_LOG"
+
+    # 重命名为 .dll
+    if [ -f "$BUILD_DIR/WrapMV.dll.so" ]; then
+        echo "✅ 生成 DLL 成功"
+
+        # 创建符号链接
+        cd "$BUILD_DIR"
+        ln -sf WrapMV.dll.so WrapMV.dll
+    else
+        echo "❌ 生成 DLL 失败"
+        exit 1
     fi
-done
-  ```
+
+    echo "=== 5. 验证生成文件 ==="
+    echo "生成的文件:"
+    ls -lh "$BUILD_DIR/" | grep -E "\.(so|dll)$"
+
+    echo ""
+    echo "文件类型检查:"
+    echo "1. libUnixMV.so: $(file "$BUILD_DIR/libUnixMV.so" | cut -d: -f2-)"
+    echo "2. WrapMV.dll:   $(file "$BUILD_DIR/WrapMV.dll" | cut -d: -f2-)"
+
+    echo ""
+    echo "=== 6. 恢复系统链接器 ==="
+    sudo ln -sf /usr/bin/aarch64-linux-gnu-ld.bfd /usr/bin/ld
+
+    echo ""
+    echo "=========================================="
+    echo "✅ 构建完成！"
+    echo "=========================================="
+    echo "生成的库文件:"
+    echo "  - $BUILD_DIR/libUnixMV.so  (Linux x86-64 共享库)"
+    echo "  - $BUILD_DIR/WrapMV.dll    (Windows x86-64 DLL)"
+    echo ""
+    echo "使用说明:"
+    echo "1. 在 x86-64 Linux 上: 使用 libUnixMV.so"
+    echo "2. 在 Windows 或 Wine 上: 使用 WrapMV.dll"
+    echo "3. 在 ARM64 Linux + Wine + Box64 上:"
+    echo "   可以通过 Wine 加载 WrapMV.dll"
+    echo "   WrapMV.dll 会动态加载 libUnixMV.so"
+    echo "=========================================="
+    ```
+    另外，还需要在Windows平台生成WrapMV.lib文件，方法：
+    > 在开始菜单中打开x64 Native Tools Command Prompt for VS 2019命令行窗口，切换到WrapMV目录下，输入指令
+    > ```
+    > lib.exe /def:F:\WrapMV\src\WrapMV.def /out:F:\WrapMV\src\WrapMV.lib
+    > ```
+5. 使用包装库
+
+
+    **获取相机参数失败**
+
+    命令窗口打印`[UnixMV] GetIntFeatureMax: GainRaw = 549755118553, result: -110`，在大华相机库里，-110意味着数据类型错误，从大华安装路径提供的demo发现，GainRaw在Linux x64相机SDK里被定义为double类型，但是在Windows相机SDK里面被定义为int64类型，修改这个地方的属性值查询函数即可。
+    ```C++
+    // 原代码
+    int gain_val[3];
+		int nRet = WRAP_IMV_GetIntFeatureMax(m_Handle, "GainRaw", &gain_val[0]);
+    ```
+    ```C++
+    // 修复代码
+    double gain_val[3];
+		int nRet = WRAP_IMV_GetDoubleFeatureMax(m_Handle, "GainRaw", &gain_val[0]);
+    ```
+
+## 2.5 串口通信实现
+
+**1. 技术路线**
+
+实际上Wine已经实现了Linux串口的Windows调用，我们只需要进行一些特殊的操作即可。
+```mermaid
+flowchart TD
+    A[📱 Windows EXE<br/>调用 COM1-COM9] --> B{🔀 Wine 设备映射器}
+    
+    B --> C[物理串口<br/>/dev/ttyS0-S3]
+    B --> D[USB转串口<br/>/dev/ttyUSB0]
+    B --> E[虚拟串口<br/>/tmp/wine-com*]
+    
+    C --> F[💻 Linux TTY 子系统]
+    D --> F
+    E --> F
+    
+    F --> G[🖥️ 硬件接口<br/>UART/USB/PTY]
+    
+    H[⚙️ 配置映射<br/>COM1→/dev/ttyS0] -.-> B
+```
+
+**2. 实现方法**
+
+查看当前已经连接的串口设备
+```linux
+sudo dmesg | grep ttyS*
+
+# 查询结果
+... ...
+# 光机串口
+[    5.681597] cdc_acm 5-1.3:1.0: ttyACM0: USB ACM device
+# Hub板串口
+[    5.708020] usb 7-1: FTDI USB Serial Device converter now attached to ttyUSB0
+.. ...
+```
+
+在Wine搭建的虚拟Windows环境目录里查看当前的映射关系
+```linux
+ll ~/.wine-xtom/dosdevices/
+
+# 查询结果
+总用量 8
+drwxrwxr-x 2 user user 4096 12月 19 16:37 ./
+drwxrwxr-x 5 user user 4096 12月 19 16:49 ../
+# 实际上C盘也是wine映射的某一路径
+lrwxrwxrwx 1 user user   10 12月 11 09:47 c: -> ../drive_c/
+# HUB板USB串口从 /dev/usb_hub 映射到 com1
+lrwxrwxrwx 1 user user   12 12月 19 16:37 com1 -> /dev/usb_hub
+# 无硬件连接的串口
+lrwxrwxrwx 1 user user   10 12月 19 16:37 com10 -> /dev/ttyS6
+lrwxrwxrwx 1 user user   10 12月 19 16:37 com11 -> /dev/ttyS7
+lrwxrwxrwx 1 user user   10 12月 19 16:37 com12 -> /dev/ttyS8
+lrwxrwxrwx 1 user user   10 12月 19 16:37 com13 -> /dev/ttyS9
+lrwxrwxrwx 1 user user   11 12月 19 16:37 com14 -> /dev/ttyS10
+... ...
+```
+
+但是，Wine这样的随机映射方法并不方便我们使用串口，我们需要通过Wine的注册表来指定其映射规则，如图所示，COM1对应/dev/usb_hub的串口设备。
+```linux
+# 打开Wine的注册表
+~/wine-xtom regedit
+```
+![alt text](e7ff6c9238a463d3b7eb09889adebe17.png)
+
+现在，又出现新的问题：Linux内核根据设备枚举顺序动态分配ttyUSB0或ttyACM1这样的名字，一旦顺序变化，WINE里固定的映射就会失效，因此我们需要在Linux系统层面，为USB串口设备创建稳定、唯一的固定名称。这里可以通过udev规则为特定USB串口指定一个别名，这样我们在处理Wine的串口映射关系就会变得很便捷。
+
+首先查询设备信息
+```linux
+# 查询ttyUSB0串口的信息
+udevadm info -a -n /dev/ttyUSB0 | grep -E "({serial}|{idVendor}|{idProduct})" | head -3
+
+# 查询结果
+    # 序列号
+    ATTRS{serial}=="ANZ23BL2"
+    # 厂商ID
+    ATTRS{idVendor}=="0403"
+    # 产品ID
+    ATTRS{idProduct}=="6001"
+```
+
+根据查询到的设备信息为其指定命名规则，这条规则的意义：当内核检测到符合上述条件的串口设备时，除了它本身的名字，再创建一个名为 usb_xxx的符号链接指向它。
+```linux
+# 创建 udev 规则文件
+sudo vim /etc/udev/rules.d/99-my-usb-serial.rules
+
+
+# 文件内容
+# MODE="0666" 让所有用户都有读写权限，可以避免WINE运行时因权限问题打不开设备
+
+# 为投影仪USB串口线创建固定别名 /dev/usb_projector
+KERNEL=="ttyUSB*", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="usb_projector", MODE="0666"
+
+# 为USB HUB设备创建固定别名 /dev/usb_hub
+KERNEL=="ttyACM*", ATTRS{idVendor}=="34bf", ATTRS{idProduct}=="ff02", SYMLINK+="usb_hub", MODE="0666"
+
+# 为USB 转台设备创建固定别名 /dev/usb_turn
+KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="usb_turn", MODE="0666"
+
+
+# 重新加载udev规则
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+重新加载映射规则后，再次插拔USB接口，即可发现`/dev/usb_projector`、`/dev/usb_hub`、`/dev/usb_turn`别名创建成功，它们分别链接到当前的 ttyUSBx 和 ttyACMx。
+```linux
+ls -l /dev/usb_projector /dev/usb_hub /dev/usb_turn
+```
+现在，我们就可以在Windows代码中指定固定的串口COM1 COM2 COM3来使用了。
