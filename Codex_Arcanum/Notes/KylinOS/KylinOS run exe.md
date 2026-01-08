@@ -2789,7 +2789,60 @@ wrappedlib_t wrappedlibs[] = {
 
 **2. 问题处理：Wine层包装类代码实现**
 
-Box64层代码实现之后，Wine层的包装方法实际上和**2.3**节方法相同，在这里对其进行了简化，代码贴在下面：
+Box64层代码实现之后，Wine层的包装方法实际上和**2.4.1**节方法类似，不同的是我们在这里实现了Linux → Windows 回调函数的转接：
+
+```mermaid
+graph TD
+    A[Windows应用程序] --> B[注册回调函数<br/>pFrameCallBack]
+    
+    B --> C[Wine Wrap层<br/>存储函数指针]
+    
+    C --> D[定义包装回调<br/>wrapFrameCallBack]
+    
+    D --> E[Box64包装器<br/>注册到ARM驱动]
+    
+    E --> F[ARM相机驱动<br/>libMVSDK.so]
+    
+    F --> G{图像采集事件触发}
+    
+    G --> H[ARM驱动调用<br/>wrapFrameCallBack]
+    
+    H --> I[Box64正确传递<br/>回调参数]
+    
+    I --> J[wrapFrameCallBack<br/>被调用]
+    
+    J --> K{问题: 无法直接调用<br/>Windows回调指针}
+    
+    K --> L[解决方案: 回调转发线程]
+    
+    subgraph "Wine Wrap层 实现"
+        M[为每个相机创建<br/>回调转发线程]
+        N[图像数据队列]
+        O[回调通知队列]
+        P[线程: 等待通知 → 调用Windows回调]
+    end
+    
+    J --> N[拷贝图像数据到队列]
+    J --> O[发送回调通知]
+    
+    O --> P
+    N --> P
+    
+    P --> Q[调用Windows<br/>pFrameCallBack]
+    
+    Q --> R[应用程序收到<br/>回调通知]
+    
+    style A fill:#e1f5fe
+    style C fill:#f3e5f5
+    style E fill:#e8f5e8
+    style F fill:#fff3e0
+    style M fill:#ffecb3
+    style P fill:#c8e6c9
+    style Q fill:#b3e5fc
+    
+    linkStyle 10 stroke:#f44336,stroke-width:2px,stroke-dasharray: 5 5
+```
+在这个技术路线中，回调的解决方法实际上比较繁琐，如果能够搞清楚 Linux 和 Windows 系统调用函数时底层内存的分配方式，就可以更优雅地实现这一部分代码，我的代码贴在下面：
 
 ```C
 // WrapMV.h
