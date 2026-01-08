@@ -12,13 +12,7 @@
 >
 > 硬件架构：ARM64
 >
-> 注：
->
-> [20251110 失败]目前在Debian/Ubuntu仓库未能找到ARM64版本的wine，因此采用源码编译方法安装；
->
-> [20251111 成功]使用Box64 + Wine技术路线，能够正常打开Wine，至于对Windows软件的适配性，需要进一步测试；
->
-> [20251120 成功]处理了动态链接库的冲突，OM软件可以打开，但是打开项目时会闪退，需要进一步处理内部的依赖关系；
+> **注：Wine Arm版本没有意义，存在致命依赖问题：加密/授权库 - 官网不提供Windows Arm版本，因此，Wine Arm版本不需要考虑。**
 
 # 1、Wine环境配置
 
@@ -731,8 +725,6 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 | 基础运行时库 | 直接使用  | Wine内置或可通过winetricks安装 | ⭐        |
 | 纯计算函数   | 直接使用  | 架构转换开销可接受             | ⭐⭐       |
 | 硬件交互类   | DLL包装器 | 需要直接访问Linux驱动          | ⭐⭐⭐⭐     |
-| 显卡计算类   | 最难处理  | 涉及GPU架构差异                | ⭐⭐⭐⭐⭐    |
-| 专用加密狗   | 混合方案  | 需要特定驱动支持               | ⭐⭐⭐      |
 
 - 可以直接使用的库
 
@@ -838,17 +830,6 @@ ENTRYPOINT ["/app/entrypoint.sh"]
     F --> I[创建包装器]
     G --> J[使用WineD3D]
     H --> K[TensorFlow Lite等]
-  ```
-
-  **加密狗处理**
-
-  ```
-  # 威步加密狗
-  WIBUCM64.dll
-  
-  # 其他许可证管理
-  sentinel.dll
-  hasplms.dll
   ```
 
 ## 2.2 初步运行测试
@@ -1665,6 +1646,7 @@ ENTRYPOINT ["/app/entrypoint.sh"]
   ```
 
 ## 2.4 DLL包装器实现
+### 2.4.1 DLL包装器实现【底层调用Linux x64 相机驱动库】(失败)
 
 1. **技术路线**
 
@@ -1957,6 +1939,2538 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 		int nRet = WRAP_IMV_GetDoubleFeatureMax(m_Handle, "GainRaw", &gain_val[0]);
     ```
 
+    
+### 2.4.2 双层DLL包装器实现【exe → Wine → Box64 → Linux Arm 相机驱动库】
+**技术路线**
+```mermaid
+graph TD
+    A[x64 Windows 应用程序<br/>EXE文件] --> B[第一层包装<br/>Winegcc编译的DLL]
+    
+    B --> C{dlopen/dlsym<br/>动态加载ARM库}
+    
+    C --> D[Box64拦截层<br/>wrappedlibMVSDK.so]
+    
+    D --> E{参数处理与转换}
+    
+    E --> F[ARM64相机驱动库<br/>libMVSDK.so]
+    
+    F --> G[实际硬件操作<br/>相机设备]
+    
+    subgraph "关键转换步骤 (Box64实现)"
+        H1[参数顺序交换<br/>void*, uint → uint, void*]
+        H2[指针值修复<br/>0x89e24c2000000000 → 0x89e24c20]
+        H3[内存映射复制<br/>ARM内存 → x64内存]
+        H4[结构体对齐处理<br/>确保兼容性]
+    end
+    
+    E --> H1
+    E --> H2
+    E --> H3
+    E --> H4
+    
+    H1 --> F
+    H2 --> F
+    H3 --> F
+    H4 --> F
+    
+    style A fill:#e1f5fe
+    style B fill:#f3e5f5
+    style D fill:#e8f5e8
+    style F fill:#fff3e0
+    style G fill:#ffebee
+    
+    style H1 fill:#c8e6c9
+    style H2 fill:#c8e6c9
+    style H3 fill:#c8e6c9
+    style H4 fill:#c8e6c9
+```
+
+
+**1. 问题处理：Box64层包装类代码实现**
+
+Box64转接层主要需要两个文件：`wrappedlibMVSDK.c`、`wrappedlibMVSDK_private.h`
+
+- `wrappedlibMVSDK_private.h`用来定义要调用的Arm层相机驱动的函数类型；
+- `wrappedlibMVSDK.c`用来实现Arm层相机驱动的函数调用。
+
+代码贴在这里，内容都比较好理解：
+```C
+// wrappedlibMVSDK.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#define _GNU_SOURCE         /* See feature_test_macros(7) */
+#include <dlfcn.h>
+
+#include "wrappedlibs.h"
+
+#include "debug.h"
+#include "wrapper.h"
+#include "bridge.h"
+#include "librarian/library_private.h"
+#include "x64emu.h"
+#include "emu/x64emu_private.h"
+#include "callback.h"
+#include "librarian.h"
+#include "box64context.h"
+#include "emu/x64emu_private.h"
+#include "myalign.h"
+
+const char* libMVSDKName = "libMVSDK.so";
+// 这里的定义会影响wrappercallback.h头文件中结构体的名字
+#define LIBNAME libMVSDK
+
+// 定义ARM库的实际路径
+// 在wrappedlib_init.h头文件中如果第一次动态链接库未加载成功，
+// 会根据真实路径再次尝试加载
+#ifndef ALTNAME
+#define ALTNAME "/opt/HuarayTech/MVviewer/lib/libMVSDK.so"
+#endif
+
+// 这个头文件里会定义
+// #define SUPER() ADDED_FUNCTIONS() \
+//     GO(IMV_GetVersion, pFv_t)
+// 进而在wrappercallback.h头文件定义的libMVSDK_my_s结构体为
+// struct libMVSDK_my_s
+// {
+//     pFv_t IMV_GetVersion;
+//     iFpip_t IMV_CreateHandle;
+//     ... 
+// } libMVSDK_my_t;
+// 包含相机库所有函数的指针
+#include "generated/wrappedlibMVSDKtypes.h"
+
+// 在wrappercallback.h头文件中定义结构体 libMVSDK_my_s，同时定义
+// 库句柄指针，用于后续的 dlsym 调用
+// static library_t* my_lib = NULL;
+// 创建结构体实例并初始化为0
+// static libMVSDK_my_t my_libMVSDK = {0};
+// 创建常量指针指向该实例,代码中通过 my->函数名 访问函数指针
+// static libMVSDK_my_t * const my = &my_libMVSDK;
+#include "wrappercallback.h"
+
+// #define DEBUG_ENABLED 1
+#ifdef DEBUG_ENABLED
+    #define DEBUG_LOG(fmt, ...) printf("[libMVSDK wrapper] " fmt "\n", ##__VA_ARGS__)
+#else
+    #define DEBUG_LOG(fmt, ...)
+#endif
+
+// ================定义图像帧的结构体================
+typedef	void*	IMV_FRAME_HANDLE;				///< \~chinese 帧句柄
+
+#define IMV_GVSP_PIX_MONO                           0x01000000
+#define IMV_GVSP_PIX_RGB                            0x02000000
+#define IMV_GVSP_PIX_COLOR                          0x02000000
+#define IMV_GVSP_PIX_CUSTOM                         0x80000000
+#define IMV_GVSP_PIX_COLOR_MASK                     0xFF000000
+
+// Indicate effective number of bits occupied by the pixel (including padding).
+// This can be used to compute amount of memory required to store an image.
+#define IMV_GVSP_PIX_OCCUPY1BIT                     0x00010000
+#define IMV_GVSP_PIX_OCCUPY2BIT                     0x00020000
+#define IMV_GVSP_PIX_OCCUPY4BIT                     0x00040000
+#define IMV_GVSP_PIX_OCCUPY8BIT                     0x00080000
+#define IMV_GVSP_PIX_OCCUPY12BIT                    0x000C0000
+#define IMV_GVSP_PIX_OCCUPY16BIT                    0x00100000
+#define IMV_GVSP_PIX_OCCUPY24BIT                    0x00180000
+#define IMV_GVSP_PIX_OCCUPY32BIT                    0x00200000
+#define IMV_GVSP_PIX_OCCUPY36BIT                    0x00240000
+#define IMV_GVSP_PIX_OCCUPY48BIT                    0x00300000
+
+typedef enum _IMV_EPixelType
+{
+	// Undefined pixel type
+	gvspPixelTypeUndefined = -1,
+
+	// Mono Format
+	gvspPixelMono1p = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY1BIT | 0x0037),
+	gvspPixelMono2p = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY2BIT | 0x0038),
+	gvspPixelMono4p = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY4BIT | 0x0039),
+	gvspPixelMono8 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY8BIT | 0x0001),
+	gvspPixelMono8S = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY8BIT | 0x0002),
+	gvspPixelMono10 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x0003),
+	gvspPixelMono10Packed = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY12BIT | 0x0004),
+	gvspPixelMono12 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x0005),
+	gvspPixelMono12Packed = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY12BIT | 0x0006),
+	gvspPixelMono14 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x0025),
+	gvspPixelMono16 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x0007),
+
+	// Bayer Format
+	gvspPixelBayGR8 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY8BIT | 0x0008),
+	gvspPixelBayRG8 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY8BIT | 0x0009),
+	gvspPixelBayGB8 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY8BIT | 0x000A),
+	gvspPixelBayBG8 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY8BIT | 0x000B),
+	gvspPixelBayGR10 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x000C),
+	gvspPixelBayRG10 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x000D),
+	gvspPixelBayGB10 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x000E),
+	gvspPixelBayBG10 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x000F),
+	gvspPixelBayGR12 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x0010),
+	gvspPixelBayRG12 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x0011),
+	gvspPixelBayGB12 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x0012),
+	gvspPixelBayBG12 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x0013),
+	gvspPixelBayGR10Packed = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY12BIT | 0x0026),
+	gvspPixelBayRG10Packed = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY12BIT | 0x0027),
+	gvspPixelBayGB10Packed = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY12BIT | 0x0028),
+	gvspPixelBayBG10Packed = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY12BIT | 0x0029),
+	gvspPixelBayGR12Packed = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY12BIT | 0x002A),
+	gvspPixelBayRG12Packed = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY12BIT | 0x002B),
+	gvspPixelBayGB12Packed = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY12BIT | 0x002C),
+	gvspPixelBayBG12Packed = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY12BIT | 0x002D),
+	gvspPixelBayGR16 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x002E),
+	gvspPixelBayRG16 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x002F),
+	gvspPixelBayGB16 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x0030),
+	gvspPixelBayBG16 = (IMV_GVSP_PIX_MONO | IMV_GVSP_PIX_OCCUPY16BIT | 0x0031),
+
+	// RGB Format
+	gvspPixelRGB8 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY24BIT | 0x0014),
+	gvspPixelBGR8 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY24BIT | 0x0015),
+	gvspPixelRGBA8 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY32BIT | 0x0016),
+	gvspPixelBGRA8 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY32BIT | 0x0017),
+	gvspPixelRGB10 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY48BIT | 0x0018),
+	gvspPixelBGR10 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY48BIT | 0x0019),
+	gvspPixelRGB12 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY48BIT | 0x001A),
+	gvspPixelBGR12 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY48BIT | 0x001B),
+	gvspPixelRGB16 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY48BIT | 0x0033),
+	gvspPixelRGB10V1Packed = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY32BIT | 0x001C),
+	gvspPixelRGB10P32 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY32BIT | 0x001D),
+	gvspPixelRGB12V1Packed = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY36BIT | 0X0034),
+	gvspPixelRGB565P = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY16BIT | 0x0035),
+	gvspPixelBGR565P = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY16BIT | 0X0036),
+
+	// YVR Format
+	gvspPixelYUV411_8_UYYVYY = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY12BIT | 0x001E),
+	gvspPixelYUV422_8_UYVY = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY16BIT | 0x001F),
+	gvspPixelYUV422_8 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY16BIT | 0x0032),
+	gvspPixelYUV8_UYV = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY24BIT | 0x0020),
+	gvspPixelYCbCr8CbYCr = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY24BIT | 0x003A),
+	gvspPixelYCbCr422_8 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY16BIT | 0x003B),
+	gvspPixelYCbCr422_8_CbYCrY = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY16BIT | 0x0043),
+	gvspPixelYCbCr411_8_CbYYCrYY = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY12BIT | 0x003C),
+	gvspPixelYCbCr601_8_CbYCr = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY24BIT | 0x003D),
+	gvspPixelYCbCr601_422_8 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY16BIT | 0x003E),
+	gvspPixelYCbCr601_422_8_CbYCrY = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY16BIT | 0x0044),
+	gvspPixelYCbCr601_411_8_CbYYCrYY = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY12BIT | 0x003F),
+	gvspPixelYCbCr709_8_CbYCr = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY24BIT | 0x0040),
+	gvspPixelYCbCr709_422_8 = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY16BIT | 0x0041),
+	gvspPixelYCbCr709_422_8_CbYCrY = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY16BIT | 0x0045),
+	gvspPixelYCbCr709_411_8_CbYYCrYY = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY12BIT | 0x0042),
+
+	// RGB Planar
+	gvspPixelRGB8Planar = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY24BIT | 0x0021),
+	gvspPixelRGB10Planar = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY48BIT | 0x0022),
+	gvspPixelRGB12Planar = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY48BIT | 0x0023),
+	gvspPixelRGB16Planar = (IMV_GVSP_PIX_COLOR | IMV_GVSP_PIX_OCCUPY48BIT | 0x0024),
+
+	//BayerRG10p和BayerRG12p格式，针对特定项目临时添加,请不要使用
+	//BayerRG10p and BayerRG12p, currently used for specific project, please do not use them
+	gvspPixelBayRG10p = 0x010A0058,
+	gvspPixelBayRG12p = 0x010c0059,
+
+	//mono1c格式，自定义格式
+	//mono1c, customized image format, used for binary output
+	gvspPixelMono1c = 0x012000FF,
+
+	//mono1e格式，自定义格式，用来显示连通域
+	//mono1e, customized image format, used for displaying connected domain
+	gvspPixelMono1e = 0x01080FFF
+}IMV_EPixelType;
+
+typedef struct _IMV_FrameInfo
+{
+	uint64_t				blockId;				///< \~chinese 帧Id(仅对GigE/Usb/PCIe相机有效)					\~english The block ID(GigE/Usb/PCIe camera only)
+	unsigned int			status;					///< \~chinese 数据帧状态(0是正常状态)							\~english The status of frame(0 is normal status)
+	unsigned int			width;					///< \~chinese 图像宽度											\~english The width of image
+	unsigned int			height;					///< \~chinese 图像高度											\~english The height of image
+	unsigned int			size;					///< \~chinese 图像大小											\~english The size of image
+	IMV_EPixelType			pixelFormat;			///< \~chinese 图像像素格式										\~english The pixel format of image
+	uint64_t				timeStamp;				///< \~chinese 图像时间戳(仅对GigE/Usb/PCIe相机有效)			\~english The timestamp of image(GigE/Usb/PCIe camera only)
+	unsigned int			chunkCount;				///< \~chinese 帧数据中包含的Chunk个数(仅对GigE/Usb相机有效)	\~english The number of chunk in frame data(GigE/Usb Camera Only)
+	unsigned int			paddingX;				///< \~chinese 图像paddingX(仅对GigE/Usb/PCIe相机有效)			\~english The paddingX of image(GigE/Usb/PCIe camera only)
+	unsigned int			paddingY;				///< \~chinese 图像paddingY(仅对GigE/Usb/PCIe相机有效)			\~english The paddingY of image(GigE/Usb/PCIe camera only)
+	unsigned int			recvFrameTime;			///< \~chinese 图像在网络传输所用的时间(单位:微秒,非GigE相机该值为0)	\~english The time taken for the image to be transmitted over the network(unit:us, The value is 0 for non-GigE camera)
+	unsigned int			nReserved[19];			///< \~chinese 预留字段											\~english Reserved field
+}IMV_FrameInfo;
+
+typedef struct _IMV_Frame
+{
+	IMV_FRAME_HANDLE		frameHandle;			///< \~chinese 帧图像句柄(SDK内部帧管理用)						\~english Frame image handle(used for managing frame within the SDK)
+	unsigned char*			pData;					///< \~chinese 帧图像数据的内存首地址							\~english The starting address of memory of image data
+	IMV_FrameInfo			frameInfo;				///< \~chinese 帧信息											\~english Frame information
+	unsigned int			nReserved[10];			///< \~chinese 预留字段											\~english Reserved field
+}IMV_Frame;
+
+
+#include <stdio.h>
+
+// 保存为BMP图片（测试用）
+void SaveAsBMP(unsigned char* pData, int width, int height, const char* filename) {
+    // 1. 创建文件
+    FILE* file = fopen(filename, "wb");
+    
+    // 2. 写入BMP文件头（54字节）和数据
+    unsigned char header[54] = {
+        0x42, 0x4D,           // "BM"
+        0,0,0,0,              // 文件大小（稍后计算）
+        0,0,0,0,              // 保留
+        54,0,0,0,             // 数据偏移
+        40,0,0,0,             // 信息头大小
+        width & 0xFF, (width >> 8) & 0xFF, (width >> 16) & 0xFF, (width >> 24) & 0xFF, // 宽度
+        height & 0xFF, (height >> 8) & 0xFF, (height >> 16) & 0xFF, (height >> 24) & 0xFF, // 高度
+        1,0,                  // 平面数
+        24,0,                 // 每像素位数
+        0,0,0,0,              // 压缩方式
+        0,0,0,0,              // 图像大小
+        0,0,0,0,              // 水平分辨率
+        0,0,0,0,              // 垂直分辨率
+        0,0,0,0,              // 颜色数
+        0,0,0,0               // 重要颜色数
+    };
+    
+    int rowSize = ((width * 3 + 3) / 4) * 4;  // BMP要求每行4字节对齐
+    int fileSize = 54 + rowSize * height;
+    
+    // 更新文件大小
+    header[2] = fileSize & 0xFF;
+    header[3] = (fileSize >> 8) & 0xFF;
+    header[4] = (fileSize >> 16) & 0xFF;
+    header[5] = (fileSize >> 24) & 0xFF;
+    
+    // 写入文件头
+    fwrite(header, 1, 54, file);
+    
+    // 3. 写入图像数据（需要将单通道转为RGB）
+    unsigned char* rgbData = (unsigned char*)malloc(rowSize);
+    
+    for (int y = height - 1; y >= 0; y--) {  // BMP是倒着存的
+        for (int x = 0; x < width; x++) {
+            unsigned char gray = pData[y * width + x];
+            rgbData[x * 3 + 0] = gray;  // B
+            rgbData[x * 3 + 1] = gray;  // G  
+            rgbData[x * 3 + 2] = gray;  // R
+        }
+        // 填充对齐字节
+        for (int x = width * 3; x < rowSize; x++) {
+            rgbData[x] = 0;
+        }
+        fwrite(rgbData, 1, rowSize, file);
+    }
+    
+    free(rgbData);
+    fclose(file);
+}
+
+// ===============主函数实现===============
+#define MAX_CAMERAS 16  // 最多16个相机
+typedef void(*IMV_FrameCallBack)(IMV_Frame* pFrame, void* pUser);
+
+typedef struct {
+    uintptr_t callback;     // 回调函数地址
+    void* user;             // 用户自定义数据
+    void* handle;           // 相机handle
+    int used;               // 标记是否使用
+} CameraCallback;
+
+static CameraCallback g_callbacks[MAX_CAMERAS] = {0};
+
+// 根据句柄查找索引
+static int find_index_by_handle(void* handle)
+{
+    for (int i = 0; i < MAX_CAMERAS; i++) 
+    {
+        if (g_callbacks[i].used && g_callbacks[i].handle == handle) 
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// 回调包装函数
+static void frame_callback_wrapper(IMV_Frame* arm_frame, void* user_data)
+{
+    DEBUG_LOG("arm 收到图像");
+    int index = (int)(intptr_t)user_data;  // user_data 是自定义的索引号
+    
+    // 查找
+    if (index < 0 || index >= MAX_CAMERAS || !g_callbacks[index].used) {
+        DEBUG_LOG("Invalid callback index: %d\n", index);
+        return;
+    }
+    // SaveAsBMP(arm_frame->pData, arm_frame->frameInfo.width, arm_frame->frameInfo.height, "ARM.bmp");
+    CameraCallback* cb = &g_callbacks[index];
+    if (!cb->callback || !arm_frame) return;
+    
+    // SaveAsBMP(arm_frame->pData, arm_frame->frameInfo.width, arm_frame->frameInfo.height, "ARM.bmp");
+
+    RunFunctionFmt(cb->callback, "pp", arm_frame, cb->user);
+    
+    // 注意：这里不释放 data，因为它会在 IMV_AttachGrabbing 中管理
+}
+
+EXPORT int my_IMV_AttachGrabbing(x64emu_t* emu, void* handle, void* proc, void* pUser)
+{
+    DEBUG_LOG("IMV_AttachGrabbing called, callback: %p\n", proc);
+    
+    // 查找空闲位置
+    int index = -1;
+    for (int i = 0; i < MAX_CAMERAS; i++) 
+    {
+        if (!g_callbacks[i].used) 
+        {
+            index = i;
+            break;
+        }
+    }
+    
+    if (index == -1) {
+        DEBUG_LOG("No free callback slot\n");
+        return -1;
+    }
+    
+    // 设置回调信息
+    g_callbacks[index].callback = (uintptr_t)proc;
+    g_callbacks[index].handle = handle;
+    g_callbacks[index].user = pUser;
+    g_callbacks[index].used = 1;
+    
+    // 传递索引号作为 user_data
+    int result = my->IMV_AttachGrabbing(handle, frame_callback_wrapper, (void*)(intptr_t)index);
+    
+    if (result != 0) {
+        // 失败时清理
+        g_callbacks[index].used = 0;
+    }
+    
+    DEBUG_LOG("AttachGrabbing: handle=%p, index=%d, result=%d\n", 
+              handle, index, result);
+    return result;
+}
+
+EXPORT int my_IMV_StopGrabbing(x64emu_t* emu, void* handle)
+{
+    DEBUG_LOG("IMV_StopGrabbing called\n");
+    int result = my->IMV_StopGrabbing(handle);
+    // 清理回调数据
+    int index = find_index_by_handle(handle);
+    if (index != -1) 
+    {
+        DEBUG_LOG("Cleaning callback at index %d\n", index);
+        g_callbacks[index].used = 0;
+        g_callbacks[index].callback = 0;
+        g_callbacks[index].user = NULL;
+        g_callbacks[index].handle = NULL;
+    }
+    DEBUG_LOG("IMV_StopGrabbing returned: %d\n", result);
+    return result;
+}
+
+EXPORT void* my_IMV_GetVersion(x64emu_t* emu) 
+{
+    DEBUG_LOG("IMV_GetVersion called\n");
+    void* result = my->IMV_GetVersion();
+    DEBUG_LOG("Version string: %s\n", (const char*)result);
+    return result;
+}
+
+EXPORT int my_IMV_EnumDevices(x64emu_t* emu, void* pDeviceList, unsigned int interfaceType)
+{
+    DEBUG_LOG("IMV_EnumDevices called\n");
+    
+    // 简单打印所有信息
+    DEBUG_LOG("emu: %p\n", emu);
+    DEBUG_LOG("pDeviceList: %p\n", pDeviceList);
+    DEBUG_LOG("interfaceType: %u (0x%x)\n", interfaceType, interfaceType);
+    
+    // 调用原始函数
+    int result = my->IMV_EnumDevices(pDeviceList, interfaceType);
+    DEBUG_LOG("returned: %d\n", result);
+    
+    return result;
+}
+
+EXPORT int my_IMV_CreateHandle(x64emu_t* emu, void** handle, int mode, void* pIdentifier) 
+{
+    DEBUG_LOG("IMV_CreateHandle called\n");
+    int result = my->IMV_CreateHandle(handle, mode, pIdentifier);
+    DEBUG_LOG("IMV_CreateHandle returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_DestroyHandle(x64emu_t* emu, void* handle)
+{
+    DEBUG_LOG("IMV_DestroyHandle called\n");
+    int result = my->IMV_DestroyHandle(handle);
+    DEBUG_LOG("IMV_DestroyHandle returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_OpenEx(x64emu_t* emu, void* handle, int accessPermission)
+{
+    DEBUG_LOG("IMV_OpenEx called\n");
+    int result = my->IMV_OpenEx(handle, accessPermission);
+    DEBUG_LOG("IMV_OpenEx returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_Close(x64emu_t* emu, void* handle)
+{
+    DEBUG_LOG("IMV_Close called\n");
+
+    if(handle)
+    {
+        for (int i = 0; i < MAX_CAMERAS; i++) 
+        {
+            if (g_callbacks[i].handle == handle) 
+            {
+                // 清理回调信息
+                g_callbacks[i].callback = NULL;
+                g_callbacks[i].handle = NULL;
+                g_callbacks[i].user = NULL;
+                g_callbacks[i].used = 0;
+                DEBUG_LOG("Clear g_callbacks[%d]\n", i);
+                break;
+            }
+        }
+    }
+    
+    int result = my->IMV_Close(handle);
+    DEBUG_LOG("IMV_Close returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_FeatureIsWriteable(x64emu_t* emu, void* handle, const char* pFeatureName)
+{
+    DEBUG_LOG("IMV_FeatureIsWriteable called for feature: %s\n", pFeatureName);
+    // 在 box64 中，函数指针都是 void* 类型
+    int result = my->IMV_FeatureIsWriteable(handle, pFeatureName);
+    DEBUG_LOG("IMV_FeatureIsWriteable returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_SetIntFeatureValue(x64emu_t* emu, void* handle, const char* pFeatureName, int64_t intValue)
+{
+    DEBUG_LOG("IMV_SetIntFeatureValue called for feature: %s, value: %ld\n", pFeatureName, intValue);
+    int result = my->IMV_SetIntFeatureValue(handle, pFeatureName, intValue);
+    DEBUG_LOG("IMV_SetIntFeatureValue returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_GetIntFeatureValue(x64emu_t* emu, void* handle, const char* pFeatureName, int64_t* pIntValue)
+{
+    DEBUG_LOG("IMV_GetIntFeatureValue called for feature: %s\n", pFeatureName);
+    int result = my->IMV_GetIntFeatureValue(handle, pFeatureName, pIntValue);
+    if (result == 0 && pIntValue) {
+        DEBUG_LOG("IMV_GetIntFeatureValue value: %ld\n", *pIntValue);
+    }
+    DEBUG_LOG("IMV_GetIntFeatureValue returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_GetIntFeatureMax(x64emu_t* emu, void* handle, const char* pFeatureName, int64_t* pIntValue)
+{
+    DEBUG_LOG("IMV_GetIntFeatureMax called for feature: %s\n", pFeatureName);
+    int result = my->IMV_GetIntFeatureMax(handle, pFeatureName, pIntValue);
+    DEBUG_LOG("IMV_GetIntFeatureMax returned: %d\n", result);
+    return result;
+}
+
+
+EXPORT int my_IMV_GetIntFeatureMin(x64emu_t* emu, void* handle, const char* pFeatureName, int64_t* pIntValue)
+{
+    DEBUG_LOG("IMV_GetIntFeatureMin called for feature: %s\n", pFeatureName);
+    int result = my->IMV_GetIntFeatureMin(handle, pFeatureName, pIntValue);
+    DEBUG_LOG("IMV_GetIntFeatureMin returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_GetIntFeatureInc(x64emu_t* emu, void* handle, const char* pFeatureName, int64_t* pIntValue)
+{
+    DEBUG_LOG("IMV_GetIntFeatureInc called for feature: %s\n", pFeatureName);
+    int result = my->IMV_GetIntFeatureInc(handle, pFeatureName, pIntValue);
+    DEBUG_LOG("IMV_GetIntFeatureInc returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_SetDoubleFeatureValue(x64emu_t* emu, void* handle, const char* pFeatureName, double doubleValue)
+{
+    DEBUG_LOG("IMV_SetDoubleFeatureValue called for feature: %s, value: %f\n", pFeatureName, doubleValue);
+    int result = my->IMV_SetDoubleFeatureValue(handle, pFeatureName, doubleValue);
+    DEBUG_LOG("IMV_SetDoubleFeatureValue returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_GetDoubleFeatureValue(x64emu_t* emu, void* handle, const char* pFeatureName, double* pDoubleValue)
+{
+    DEBUG_LOG("IMV_GetDoubleFeatureValue called for feature: %s\n", pFeatureName);
+    int result = my->IMV_GetDoubleFeatureValue(handle, pFeatureName, pDoubleValue);
+    DEBUG_LOG("IMV_GetDoubleFeatureValue returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_GetDoubleFeatureMax(x64emu_t* emu, void* handle, const char* pFeatureName, double* pDoubleValue)
+{
+    DEBUG_LOG("IMV_GetDoubleFeatureMax called for feature: %s\n", pFeatureName);
+    int result = my->IMV_GetDoubleFeatureMax(handle, pFeatureName, pDoubleValue);
+    DEBUG_LOG("IMV_GetDoubleFeatureMax returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_GetDoubleFeatureMin(x64emu_t* emu, void* handle, const char* pFeatureName, double* pDoubleValue)
+{
+    DEBUG_LOG("IMV_GetDoubleFeatureMin called for feature: %s\n", pFeatureName);
+    int result = my->IMV_GetDoubleFeatureMin(handle, pFeatureName, pDoubleValue);
+    DEBUG_LOG("IMV_GetDoubleFeatureMin returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_SetEnumFeatureValue(x64emu_t* emu, void* handle, const char* pFeatureName, uint64_t enumValue)
+{
+    DEBUG_LOG("IMV_SetEnumFeatureValue called for feature: %s, value: %lu\n", pFeatureName, enumValue);
+    int result = my->IMV_SetEnumFeatureValue(handle, pFeatureName, enumValue);
+    DEBUG_LOG("IMV_SetEnumFeatureValue returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_GetEnumFeatureValue(x64emu_t* emu, void* handle, const char* pFeatureName, uint64_t* pEnumValue)
+{
+    DEBUG_LOG("IMV_GetEnumFeatureValue called for feature: %s\n", pFeatureName);
+    int result = my->IMV_GetEnumFeatureValue(handle, pFeatureName, pEnumValue);
+    DEBUG_LOG("IMV_GetEnumFeatureValue returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_ExecuteCommandFeature(x64emu_t* emu, void* handle, const char* pFeatureName)
+{
+    DEBUG_LOG("IMV_ExecuteCommandFeature called for feature: %s\n", pFeatureName);
+    int result = my->IMV_ExecuteCommandFeature(handle, pFeatureName);
+    DEBUG_LOG("IMV_ExecuteCommandFeature returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_StartGrabbing(x64emu_t* emu, void* handle)
+{
+    DEBUG_LOG("IMV_StartGrabbing called\n");
+    int result = my->IMV_StartGrabbing(handle);
+    DEBUG_LOG("IMV_StartGrabbing returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_GetFrame(x64emu_t* emu, void* handle, void* pFrame, unsigned int timeoutMS)
+{
+    DEBUG_LOG("IMV_GetFrame called, timeout: %d ms\n", timeoutMS);
+    IMV_Frame arm_frame;
+    memset(&arm_frame, 0, sizeof(IMV_Frame));
+    int result = my->IMV_GetFrame(handle, &arm_frame, timeoutMS);
+    if (result == 0) 
+    {
+        // 获取x86端的帧指针
+        IMV_Frame* x86_frame = (IMV_Frame*)pFrame;
+        
+        DEBUG_LOG("ARM Frame: width=%u, height=%u, size=%u, pData=%p\n",
+               arm_frame.frameInfo.width, 
+               arm_frame.frameInfo.height, 
+               arm_frame.frameInfo.size,
+               arm_frame.pData);
+        
+        // 1. 拷贝frameInfo
+        if (arm_frame.frameInfo.size > 0) 
+        {
+            // 确保x86端有足够空间
+            if (x86_frame) 
+            {
+                // 拷贝frameInfo结构体
+                memcpy(&x86_frame->frameInfo, &arm_frame.frameInfo, sizeof(IMV_FrameInfo));
+                
+                // 2. 处理图像数据
+                if (arm_frame.pData && arm_frame.frameInfo.size > 0) 
+                {
+                    // 分配内存给x86端
+                    x86_frame->pData = (unsigned char*)malloc(arm_frame.frameInfo.size);
+                    
+                    if (x86_frame->pData) 
+                    {
+                        // 拷贝图像数据
+                        memcpy(x86_frame->pData, arm_frame.pData, arm_frame.frameInfo.size);
+                        DEBUG_LOG("Copied %u bytes of image data\n", arm_frame.frameInfo.size);
+                    } else 
+                    {
+                        DEBUG_LOG("ERROR: Failed to allocate %u bytes for image data\n", 
+                               arm_frame.frameInfo.size);
+                        result = -101; // 返回错误
+                    }
+                } 
+                else 
+                {
+                    x86_frame->pData = NULL;
+                }
+                
+                // 3. 拷贝frameHandle
+                x86_frame->frameHandle = arm_frame.frameHandle;
+                
+                // 4. 拷贝预留字段
+                memcpy(x86_frame->nReserved, arm_frame.nReserved, sizeof(arm_frame.nReserved));
+                
+            } 
+            else 
+            {
+                DEBUG_LOG("[libMVSSDK wrapper] ERROR: x86_frame is NULL!\n");
+                result = -101;
+            }
+        }
+    } 
+    else 
+    {
+        DEBUG_LOG("GetFrame failed with error: %d\n", result);
+    }
+    
+    DEBUG_LOG("Releasing ARM frame...\n");
+    my->IMV_ReleaseFrame(handle, &arm_frame);
+
+    DEBUG_LOG("IMV_GetFrame returned: %d\n", result);
+    return result;
+}
+
+EXPORT int my_IMV_ReleaseFrame(x64emu_t* emu, void* handle, void* pFrame)
+{
+    DEBUG_LOG("IMV_ReleaseFrame called\n");
+
+    if(!pFrame) return 0;
+    IMV_Frame* arm_frame = (IMV_Frame*)pFrame;
+    // 打印传入的值
+    DEBUG_LOG("[BOX64-RELEASE] Received from Windows:\n");
+    DEBUG_LOG("[BOX64-RELEASE]   x86_frame->pData       = 0x%016llX\n",
+           (unsigned long long)arm_frame->pData);
+    DEBUG_LOG("[BOX64-RELEASE]   x86_frame->frameHandle = 0x%016llX\n",
+           (unsigned long long)arm_frame->frameHandle);
+
+    if(arm_frame->pData)
+    {
+        free(arm_frame->pData);
+        arm_frame->pData = NULL;
+    }
+    if(arm_frame->frameHandle)
+    {
+        arm_frame->frameHandle = NULL;
+    }
+
+    DEBUG_LOG("IMV_ReleaseFrame returned.");
+    return 0;
+}
+
+// 可以添加更多函数的包装
+
+// ============== 初始化配置 ==============
+#define CUSTOM_INIT \
+    printf_log(LOG_INFO, "Starting libMVSDK wrapper initialization\n"); \
+    getMy(lib); \
+    if(!my->IMV_GetVersion || !my->IMV_CreateHandle) { \
+        printf_log(LOG_NONE, "ERROR: Required functions not found in libMVSDK\n"); \
+    } \
+    printf_log(LOG_INFO, "libMVSDK wrapper initialized successfully\n");
+
+#define CUSTOM_FINI \
+    freeMy();
+
+#define ALTMY my_
+// 如果定义了ALTMY，在wrappedlib_init.h中会执行函数指针重定向
+// 如：my->IMV_CreateHandle = my_IMV_CreateHandle;
+#include "wrappedlib_init.h"
+```
+
+```C
+// wrappedlibMVSDK_private.h
+#if !(defined(GO) && defined(GOM) && defined(GO2) && defined(DATA))
+#error meh!
+#endif
+
+// 主要函数定义
+GOM(IMV_GetVersion, pFEv)                // void* func(void)  
+GOM(IMV_EnumDevices, iFEpu)              // int func(void*, unsigned int)
+GOM(IMV_CreateHandle, iFEpip)            // int func(void**, int, void*)
+GOM(IMV_DestroyHandle, iFEp)             // int func(void*)
+GOM(IMV_OpenEx, iFEpi)                   // int func(void*, int)
+GOM(IMV_Close, iFEp)                     // int func(void*)
+GOM(IMV_FeatureIsWriteable, iFEpp)       // int func(void*, const char*)
+GOM(IMV_SetIntFeatureValue, iFEppL)      // int func(void*, const char*, int64_t)
+GOM(IMV_GetIntFeatureValue, iFEppp)      // int func(void*, const char*, int64_t*)
+GOM(IMV_GetIntFeatureMax, iFEppp)        // int func(void*, const char*, int64_t*)
+GOM(IMV_GetIntFeatureMin, iFEppp)        // int func(void*, const char*, int64_t*)
+GOM(IMV_GetIntFeatureInc, iFEppp)        // int func(void*, const char*, int64_t*)
+GOM(IMV_SetDoubleFeatureValue, iFEppd)   // int func(void*, const char*, double)
+GOM(IMV_GetDoubleFeatureValue, iFEppp)   // int func(void*, const char*, double*)
+GOM(IMV_GetDoubleFeatureMax, iFEppp)     // int func(void*, const char*, double*)
+GOM(IMV_GetDoubleFeatureMin, iFEppp)     // int func(void*, const char*, double*)
+GOM(IMV_SetEnumFeatureValue, iFEppl)     // int func(void*, const char*, uint64_t)
+GOM(IMV_GetEnumFeatureValue, iFEppp)     // int func(void*, const char*, uint64_t*)
+GOM(IMV_ExecuteCommandFeature, iFEpp)    // int func(void*, const char*)
+GOM(IMV_StartGrabbing, iFEp)             // int func(void*)
+GOM(IMV_StopGrabbing, iFEp)              // int func(void*)
+GOM(IMV_AttachGrabbing, iFEppp)          // int func(void*, void*, void*)
+GOM(IMV_GetFrame, iFEppu)                // int func(void*, void*, unsigned int)
+GOM(IMV_ReleaseFrame, iFEpp)             // int func(void*, void*)
+
+```
+
+以上代码需要放在`box64/src/wrapped/`目录，重新编译Box64时候`box64/CMakeLists.txt`文件会调用`box64/rebuild_wrappers.py`文件，根据`wrappedlibMVSDK_private.h`文件在`box64/src/wrapped/generated/`目录生成对应的头文件（主要是根据Box64的宏定义来生成具体的函数类型），并将我们定义的转接功能集成到 Box64 中。
+
+此外，在重新编译Box64之前，我们还需要对编译文件进行修改。
+
+1. 修改`box64/CMakeLists.txt`文件内容，在`CMakeLists.txt`中找到WRAPPEDS变量的定义部分，添加包装文件：
+
+```cmake
+# 在 WRAPPEDS 列表中添加新包装库
+set(WRAPPEDS
+    "${BOX64_ROOT}/src/wrapped/wrappedalure.c"
+    # ... 其他已有文件 ...
+    "${BOX64_ROOT}/src/wrapped/wrappedlibtasn1.c"
+    "${BOX64_ROOT}/src/wrapped/wrappedlibnettle8.c"
+    "${BOX64_ROOT}/src/wrapped/wrappedlibunistring2.c"
+    "${BOX64_ROOT}/src/wrapped/wrappedlibhogweed6.c"
+    "${BOX64_ROOT}/src/wrapped/wrappedlibsqlite3.c"
+    "${BOX64_ROOT}/src/wrapped/wrappedlibtiff5.c"
+    "${BOX64_ROOT}/src/wrapped/wrappedbrotlidec.c"
+    "${BOX64_ROOT}/src/wrapped/wrappedzstd.c"
+    # 添加新包装文件
+    "${BOX64_ROOT}/src/wrapped/wrappedlibMVSDK.c"
+)
+```
+
+2. 修改`library_list.h`文件：
+
+我们首先分析box64的库加载原理：
+```text
+程序启动 → 读取ELF的DT_NEEDED → 对每个依赖库：
+    ↓
+if (库在 wrappedlibs 中) {
+    调用对应的 init 函数
+    标记为 LIB_WRAPPED
+    输出 "Using native(wrapped) xxx"
+} else {
+    尝试加载为模拟库
+    输出 "Using emulated xxx"
+}
+```
+其中wrappedlibs数组是 box64 的核心机制之一，它定义了哪些库需要被包装，而wrappedlibs数组的初始化函数是这样的：
+```c++
+wrappedlib_t wrappedlibs[] = {
+#ifdef STATICBUILD
+#include "library_list_static.h"
+#else
+#include "library_list.h"
+#endif
+};
+```
+
+工作原理：
+
+- 预处理阶段：编译器将 #include "library_list.h" 替换为文件内容
+- 宏展开：GO("libMVSDK.so", libMVSDK) 被展开为 {"libMVSDK.so", wrappedlibMVSDK_init, wrappedlibMVSDK_fini},
+- 结果：数组包含所有展开后的结构体
+
+假设 library_list.h 内容是：
+```c++
+GO("libavutil.so.56", libavutil56)
+GO("libavformat.so.58", libavformat58)
+GO("libMVSDK.so", libMVSDK)
+```
+预处理后会变成：
+```c++
+wrappedlib_t wrappedlibs[] = {
+    {"libavutil.so.56", wrappedlibavutil56_init, wrappedlibavutil56_fini},
+    {"libavformat.so.58", wrappedlibavformat58_init, wrappedlibavformat58_fini},
+    {"libMVSDK.so", wrappedlibMVSDK_init, wrappedlibMVSDK_fini},
+};
+```
+在library_list.h头文件中，实际上包含了所有需要加载的arm动态链接库，在文件末尾添加`GO("libMVSDK.so", libMVSDK)`即可。
+
+上述工作完成后，按照**1.2.1**节内容重新编译Box64即可得到我们私人定制的Box64版本。
+
+**2. 问题处理：Wine层包装类代码实现**
+
+Box64层代码实现之后，Wine层的包装方法实际上和**2.3**节方法相同，在这里对其进行了简化，代码贴在下面：
+
+```C
+// WrapMV.h
+#ifndef WRAPMV_H
+#define WRAPMV_H
+
+#include <stdint.h>     // 标准整型
+#include <stdbool.h>    // 标准布尔型
+
+// ==================== DLL导出定义 ====================
+#ifdef __WINE__
+    // Wine + winegcc 环境
+    #include <windows.h>  // winegcc提供简化的windows.h
+    
+    // 确保WINAPI有定义（winegcc应该已经定义了）
+    #ifndef WINAPI
+    #define WINAPI
+    #endif
+
+    #define WRAP_IMV_CALL WINAPI
+
+#elif defined(_WIN32) || defined(_WIN64) || defined(WIN32) || defined(WIN64)
+    // 原生Windows环境 (MSVC/MinGW)
+    #include <windows.h>  // 标准的windows.h
+    
+    #define WRAP_IMV_CALL WINAPI  // WINAPI已定义为__stdcall
+
+#else
+    // 纯Unix/Linux环境（非Wine）
+    #define WRAP_IMV_CALL
+    
+    // 提供基本类型定义
+    typedef void* HANDLE;
+    typedef int BOOL;
+    #define TRUE 1
+    #define FALSE 0
+#endif
+
+// ==================== 参数方向标记 ====================
+#define IN
+#define OUT
+#define IN_OUT
+
+/// \~chinese
+/// \brief 错误码 
+/// \~english
+/// \brief Error code
+#define WRAP_IMV_OK						0			///< \~chinese 成功，无错误							\~english Successed, no error
+#define WRAP_IMV_ERROR					-101		///< \~chinese 通用的错误							\~english Generic error
+#define WRAP_IMV_INVALID_HANDLE			-102		///< \~chinese 错误或无效的句柄						\~english Error or invalid handle
+#define WRAP_IMV_INVALID_PARAM			-103		///< \~chinese 错误的参数							\~english Incorrect parameter
+#define WRAP_IMV_INVALID_FRAME_HANDLE	-104		///< \~chinese 错误或无效的帧句柄					\~english Error or invalid frame handle
+#define WRAP_IMV_INVALID_FRAME			-105		///< \~chinese 无效的帧								\~english Invalid frame
+#define WRAP_IMV_INVALID_RESOURCE		-106		///< \~chinese 相机/事件/流等资源无效				\~english Camera/Event/Stream and so on resource invalid
+#define WRAP_IMV_INVALID_IP				-107		///< \~chinese 设备与主机的IP网段不匹配				\~english Device's and PC's subnet is mismatch
+#define WRAP_IMV_NO_MEMORY				-108		///< \~chinese 内存不足								\~english Malloc memery failed
+#define WRAP_IMV_INSUFFICIENT_MEMORY	-109		///< \~chinese 传入的内存空间不足					\~english Insufficient memory
+#define WRAP_IMV_ERROR_PROPERTY_TYPE	-110		///< \~chinese 属性类型错误							\~english Property type error
+#define WRAP_IMV_INVALID_ACCESS			-111		///< \~chinese 属性不可访问、或不能读/写、或读/写失败	\~english Property not accessible, or not be read/written, or read/written failed
+#define WRAP_IMV_INVALID_RANGE			-112		///< \~chinese 属性值超出范围、或者不是步长整数倍	\~english The property's value is out of range, or is not integer multiple of the step
+#define WRAP_IMV_NOT_SUPPORT			-113		///< \~chinese 设备不支持的功能						\~english Device not supported function
+
+#define WRAP_IMV_MAX_DEVICE_ENUM_NUM	100			///< \~chinese 支持设备最大个数		\~english The maximum number of supported devices
+#define WRAP_IMV_MAX_STRING_LENTH		256			///< \~chinese 字符串最大长度		\~english The maximum length of string
+#define WRAP_IMV_MAX_ERROR_LIST_NUM		128			///< \~chinese 失败属性列表最大长度 \~english The maximum size of failed properties list
+
+typedef	void*	WRAP_IMV_HANDLE;						///< \~chinese 设备句柄				\~english Device handle 
+typedef	void*	WRAP_IMV_FRAME_HANDLE;				///< \~chinese 帧句柄				\~english Frame handle 
+
+#define WRAP_IMV_GVSP_PIX_MONO                           0x01000000
+#define WRAP_IMV_GVSP_PIX_RGB                            0x02000000
+#define WRAP_IMV_GVSP_PIX_COLOR                          0x02000000
+#define WRAP_IMV_GVSP_PIX_CUSTOM                         0x80000000
+#define WRAP_IMV_GVSP_PIX_COLOR_MASK                     0xFF000000
+
+// Indicate effective number of bits occupied by the pixel (including padding).
+// This can be used to compute amount of memory required to store an image.
+#define WRAP_IMV_GVSP_PIX_OCCUPY1BIT                     0x00010000
+#define WRAP_IMV_GVSP_PIX_OCCUPY2BIT                     0x00020000
+#define WRAP_IMV_GVSP_PIX_OCCUPY4BIT                     0x00040000
+#define WRAP_IMV_GVSP_PIX_OCCUPY8BIT                     0x00080000
+#define WRAP_IMV_GVSP_PIX_OCCUPY12BIT                    0x000C0000
+#define WRAP_IMV_GVSP_PIX_OCCUPY16BIT                    0x00100000
+#define WRAP_IMV_GVSP_PIX_OCCUPY24BIT                    0x00180000
+#define WRAP_IMV_GVSP_PIX_OCCUPY32BIT                    0x00200000
+#define WRAP_IMV_GVSP_PIX_OCCUPY36BIT                    0x00240000
+#define WRAP_IMV_GVSP_PIX_OCCUPY48BIT                    0x00300000
+
+/// \~chinese
+///枚举：设备类型
+/// \~english
+///Enumeration: device type
+typedef enum WRAP_IMV_ECameraType
+{
+	typeGigeCamera = 0,						///< \~chinese GIGE相机				\~english GigE Vision Camera
+	typeU3vCamera = 1,						///< \~chinese USB3.0相机			\~english USB3.0 Vision Camera
+	typeCLCamera = 2,						///< \~chinese CAMERALINK 相机		\~english Cameralink camera
+	typePCIeCamera = 3,						///< \~chinese PCIe相机				\~english PCIe Camera
+	typeUndefinedCamera = 255				///< \~chinese 未知类型				\~english Undefined Camera
+}WRAP_IMV_ECameraType;
+
+/// \~chinese
+///枚举：接口类型
+/// \~english
+///Enumeration: interface type
+typedef enum WRAP_IMV_EInterfaceType
+{
+	interfaceTypeGige = 0x00000001,			///< \~chinese 网卡接口类型  		\~english NIC type
+	interfaceTypeUsb3 = 0x00000002,			///< \~chinese USB3.0接口类型		\~english USB3.0 interface type
+	interfaceTypeCL = 0x00000004, 			///< \~chinese CAMERALINK接口类型	\~english Cameralink interface type
+	interfaceTypePCIe = 0x00000008,			///< \~chinese PCIe接口类型         \~english PCIe interface type
+	interfaceTypeAll = 0x00000000,			///< \~chinese 忽略接口类型			\~english All types interface type
+	interfaceInvalidType = 0xFFFFFFFF		///< \~chinese 无效接口类型			\~english Invalid interface type
+}WRAP_IMV_EInterfaceType;
+
+/// \~chinese
+///枚举：创建句柄方式
+/// \~english
+///Enumeration: Create handle mode
+typedef enum WRAP_IMV_ECreateHandleMode
+{
+	modeByIndex = 0,						///< \~chinese 通过已枚举设备的索引(从0开始，比如 0, 1, 2...)	\~english By index of enumerated devices (Start from 0, such as 0, 1, 2...)
+	modeByCameraKey,						///< \~chinese 通过设备键"厂商:序列号"							\~english By device's key "vendor:serial number"
+	modeByDeviceUserID,						///< \~chinese 通过设备自定义名									\~english By device userID
+	modeByIPAddress,						///< \~chinese 通过设备IP地址									\~english By device IP address.
+}WRAP_IMV_ECreateHandleMode;
+
+/// \~chinese
+///枚举：访问权限
+/// \~english
+///Enumeration: access permission
+typedef enum WRAP_IMV_ECameraAccessPermission
+{
+	accessPermissionOpen = 0,				///< \~chinese GigE相机没有被连接			\~english The GigE vision device isn't connected to any application. 
+	accessPermissionExclusive,				///< \~chinese 独占访问权限					\~english Exclusive Access Permission   
+	accessPermissionControl, 				///< \~chinese 非独占可读访问权限			\~english Non-Exclusive Readbale Access Permission  
+	accessPermissionControlWithSwitchover,  ///< \~chinese 切换控制访问权限				\~english Control access with switchover enabled.	
+	accessPermissionUnknown = 254,  		///< \~chinese 无法确定						\~english Value not known; indeterminate.   	
+	accessPermissionUndefined				///< \~chinese 未定义访问权限				\~english Undefined Access Permission
+}WRAP_IMV_ECameraAccessPermission;
+
+/// \~chinese
+///枚举：图像格式
+/// \~english
+/// Enumeration:image format
+typedef enum WRAP_IMV_EPixelType
+{
+	// Undefined pixel type
+	gvspPixelTypeUndefined = -1,
+
+	// Mono Format
+	gvspPixelMono1p = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY1BIT | 0x0037),
+	gvspPixelMono2p = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY2BIT | 0x0038),
+	gvspPixelMono4p = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY4BIT | 0x0039),
+	gvspPixelMono8 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY8BIT | 0x0001),
+	gvspPixelMono8S = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY8BIT | 0x0002),
+	gvspPixelMono10 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0003),
+	gvspPixelMono10Packed = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x0004),
+	gvspPixelMono12 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0005),
+	gvspPixelMono12Packed = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x0006),
+	gvspPixelMono14 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0025),
+	gvspPixelMono16 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0007),
+
+	// Bayer Format
+	gvspPixelBayGR8 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY8BIT | 0x0008),
+	gvspPixelBayRG8 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY8BIT | 0x0009),
+	gvspPixelBayGB8 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY8BIT | 0x000A),
+	gvspPixelBayBG8 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY8BIT | 0x000B),
+	gvspPixelBayGR10 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x000C),
+	gvspPixelBayRG10 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x000D),
+	gvspPixelBayGB10 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x000E),
+	gvspPixelBayBG10 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x000F),
+	gvspPixelBayGR12 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0010),
+	gvspPixelBayRG12 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0011),
+	gvspPixelBayGB12 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0012),
+	gvspPixelBayBG12 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0013),
+	gvspPixelBayGR10Packed = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x0026),
+	gvspPixelBayRG10Packed = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x0027),
+	gvspPixelBayGB10Packed = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x0028),
+	gvspPixelBayBG10Packed = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x0029),
+	gvspPixelBayGR12Packed = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x002A),
+	gvspPixelBayRG12Packed = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x002B),
+	gvspPixelBayGB12Packed = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x002C),
+	gvspPixelBayBG12Packed = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x002D),
+	gvspPixelBayGR16 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x002E),
+	gvspPixelBayRG16 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x002F),
+	gvspPixelBayGB16 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0030),
+	gvspPixelBayBG16 = (WRAP_IMV_GVSP_PIX_MONO | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0031),
+
+	// RGB Format
+	gvspPixelRGB8 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY24BIT | 0x0014),
+	gvspPixelBGR8 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY24BIT | 0x0015),
+	gvspPixelRGBA8 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY32BIT | 0x0016),
+	gvspPixelBGRA8 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY32BIT | 0x0017),
+	gvspPixelRGB10 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY48BIT | 0x0018),
+	gvspPixelBGR10 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY48BIT | 0x0019),
+	gvspPixelRGB12 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY48BIT | 0x001A),
+	gvspPixelBGR12 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY48BIT | 0x001B),
+	gvspPixelRGB16 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY48BIT | 0x0033),
+	gvspPixelRGB10V1Packed = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY32BIT | 0x001C),
+	gvspPixelRGB10P32 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY32BIT | 0x001D),
+	gvspPixelRGB12V1Packed = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY36BIT | 0X0034),
+	gvspPixelRGB565P = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0035),
+	gvspPixelBGR565P = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0X0036),
+
+	// YVR Format
+	gvspPixelYUV411_8_UYYVYY = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x001E),
+	gvspPixelYUV422_8_UYVY = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x001F),
+	gvspPixelYUV422_8 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0032),
+	gvspPixelYUV8_UYV = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY24BIT | 0x0020),
+	gvspPixelYCbCr8CbYCr = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY24BIT | 0x003A),
+	gvspPixelYCbCr422_8 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x003B),
+	gvspPixelYCbCr422_8_CbYCrY = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0043),
+	gvspPixelYCbCr411_8_CbYYCrYY = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x003C),
+	gvspPixelYCbCr601_8_CbYCr = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY24BIT | 0x003D),
+	gvspPixelYCbCr601_422_8 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x003E),
+	gvspPixelYCbCr601_422_8_CbYCrY = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0044),
+	gvspPixelYCbCr601_411_8_CbYYCrYY = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x003F),
+	gvspPixelYCbCr709_8_CbYCr = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY24BIT | 0x0040),
+	gvspPixelYCbCr709_422_8 = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0041),
+	gvspPixelYCbCr709_422_8_CbYCrY = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY16BIT | 0x0045),
+	gvspPixelYCbCr709_411_8_CbYYCrYY = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY12BIT | 0x0042),
+
+	// RGB Planar
+	gvspPixelRGB8Planar = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY24BIT | 0x0021),
+	gvspPixelRGB10Planar = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY48BIT | 0x0022),
+	gvspPixelRGB12Planar = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY48BIT | 0x0023),
+	gvspPixelRGB16Planar = (WRAP_IMV_GVSP_PIX_COLOR | WRAP_IMV_GVSP_PIX_OCCUPY48BIT | 0x0024),
+
+	//BayerRG10p和BayerRG12p格式，针对特定项目临时添加,请不要使用
+	//BayerRG10p and BayerRG12p, currently used for specific project, please do not use them
+	gvspPixelBayRG10p = 0x010A0058,
+	gvspPixelBayRG12p = 0x010c0059,
+
+	//mono1c格式，自定义格式
+	//mono1c, customized image format, used for binary output
+	gvspPixelMono1c = 0x012000FF,
+
+	//mono1e格式，自定义格式，用来显示连通域
+	//mono1e, customized image format, used for displaying connected domain
+	gvspPixelMono1e = 0x01080FFF
+}WRAP_IMV_EPixelType;
+
+/// \~chinese
+/// \brief GigE设备信息
+/// \~english
+/// \brief GigE device information
+typedef struct WRAP_IMV_GigEDeviceInfo
+{
+	/// \~chinese
+	/// 设备支持的IP配置选项\n
+	/// value:4 相机只支持LLA\n
+	/// value:5 相机支持LLA和Persistent IP\n
+	/// value:6 相机支持LLA和DHCP\n
+	/// value:7 相机支持LLA、DHCP和Persistent IP\n
+	/// value:0 获取失败
+	/// \~english
+	/// Supported IP configuration options of device\n
+	/// value:4 Device supports LLA \n
+	/// value:5 Device supports LLA and Persistent IP\n
+	/// value:6 Device supports LLA and DHCP\n
+	/// value:7 Device supports LLA, DHCP and Persistent IP\n
+	/// value:0 Get fail
+	unsigned int nIpConfigOptions;
+	/// \~chinese
+	/// 设备当前的IP配置选项\n
+	/// value:4 LLA处于活动状态\n
+	/// value:5 LLA和Persistent IP处于活动状态\n
+	/// value:6 LLA和DHCP处于活动状态\n
+	/// value:7 LLA、DHCP和Persistent IP处于活动状态\n
+	/// value:0 获取失败
+	/// \~english
+	/// Current IP Configuration options of device\n
+	/// value:4 LLA is active\n
+	/// value:5 LLA and Persistent IP are active\n
+	/// value:6 LLA and DHCP are active\n
+	/// value:7 LLA, DHCP and Persistent IP are active\n
+	/// value:0 Get fail
+	unsigned int nIpConfigCurrent;
+	unsigned int nReserved[3];						///< \~chinese 保留					\~english Reserved field
+
+	char macAddress[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese 设备Mac地址			\~english Device MAC Address
+	char ipAddress[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese 设备Ip地址			\~english Device ip Address
+	char subnetMask[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese 子网掩码				\~english SubnetMask
+	char defaultGateWay[WRAP_IMV_MAX_STRING_LENTH];		///< \~chinese 默认网关				\~english Default GateWay
+	char protocolVersion[WRAP_IMV_MAX_STRING_LENTH];		///< \~chinese 网络协议版本			\~english Net protocol version
+	/// \~chinese
+	/// Ip配置有效性\n
+	/// Ip配置有效时字符串值"Valid"\n
+	/// Ip配置无效时字符串值"Invalid On This Interface"
+	/// \~english
+	/// IP configuration valid\n
+	/// String value is "Valid" when ip configuration valid\n
+	/// String value is "Invalid On This Interface" when ip configuration invalid
+	char ipConfiguration[WRAP_IMV_MAX_STRING_LENTH];
+	char chReserved[6][WRAP_IMV_MAX_STRING_LENTH];		///< \~chinese 保留					\~english Reserved field
+
+}WRAP_IMV_GigEDeviceInfo;
+
+/// \~chinese
+/// \brief Usb设备信息
+/// \~english
+/// \brief Usb device information
+typedef struct WRAP_IMV_UsbDeviceInfo
+{
+	bool bLowSpeedSupported;						///< \~chinese true支持，false不支持，其他值 非法。	\~english true support,false not supported,other invalid
+	bool bFullSpeedSupported;						///< \~chinese true支持，false不支持，其他值 非法。	\~english true support,false not supported,other invalid
+	bool bHighSpeedSupported;						///< \~chinese true支持，false不支持，其他值 非法。	\~english true support,false not supported,other invalid
+	bool bSuperSpeedSupported;						///< \~chinese true支持，false不支持，其他值 非法。	\~english true support,false not supported,other invalid
+	bool bDriverInstalled;							///< \~chinese true安装，false未安装，其他值 非法。	\~english true support,false not supported,other invalid
+	bool boolReserved[3];							///< \~chinese 保留		
+	unsigned int Reserved[4];						///< \~chinese 保留									\~english Reserved field
+
+	char configurationValid[WRAP_IMV_MAX_STRING_LENTH];	///< \~chinese 配置有效性							\~english Configuration Valid
+	char genCPVersion[WRAP_IMV_MAX_STRING_LENTH];		///< \~chinese GenCP 版本							\~english GenCP Version
+	char u3vVersion[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese U3V 版本号							\~english U3v Version
+	char deviceGUID[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese 设备引导号							\~english Device guid number                  
+	char familyName[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese 设备系列号							\~english Device serial number 
+	char u3vSerialNumber[WRAP_IMV_MAX_STRING_LENTH];		///< \~chinese 设备序列号							\~english Device SerialNumber
+	char speed[WRAP_IMV_MAX_STRING_LENTH];				///< \~chinese 设备传输速度							\~english Device transmission speed
+	char maxPower[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese 设备最大供电量						\~english Maximum power supply of device
+	char chReserved[4][WRAP_IMV_MAX_STRING_LENTH];		///< \~chinese 保留									\~english Reserved field
+
+}WRAP_IMV_UsbDeviceInfo;
+
+/// \~chinese
+/// \brief GigE网卡信息
+/// \~english
+/// \brief GigE interface information
+typedef struct WRAP_IMV_GigEInterfaceInfo
+{
+	char description[WRAP_IMV_MAX_STRING_LENTH];				///< \~chinese  网卡描述信息		\~english Network card description
+	char macAddress[WRAP_IMV_MAX_STRING_LENTH];				///< \~chinese  网卡Mac地址			\~english Network card MAC Address
+	char ipAddress[WRAP_IMV_MAX_STRING_LENTH];				///< \~chinese  设备Ip地址			\~english Device ip Address
+	char subnetMask[WRAP_IMV_MAX_STRING_LENTH];				///< \~chinese  子网掩码			\~english SubnetMask
+	char defaultGateWay[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese  默认网关			\~english Default GateWay
+	char chReserved[5][WRAP_IMV_MAX_STRING_LENTH];			///< 保留							\~english Reserved field
+}WRAP_IMV_GigEInterfaceInfo;
+
+/// \~chinese
+/// \brief USB接口信息
+/// \~english
+/// \brief USB interface information
+typedef struct WRAP_IMV_UsbInterfaceInfo
+{
+	char description[WRAP_IMV_MAX_STRING_LENTH];				///< \~chinese  USB接口描述信息		\~english USB interface description
+	char vendorID[WRAP_IMV_MAX_STRING_LENTH];				///< \~chinese  USB接口Vendor ID	\~english USB interface Vendor ID
+	char deviceID[WRAP_IMV_MAX_STRING_LENTH];				///< \~chinese  USB接口设备ID		\~english USB interface Device ID
+	char subsystemID[WRAP_IMV_MAX_STRING_LENTH];				///< \~chinese  USB接口Subsystem ID	\~english USB interface Subsystem ID
+	char revision[WRAP_IMV_MAX_STRING_LENTH];				///< \~chinese  USB接口Revision		\~english USB interface Revision
+	char speed[WRAP_IMV_MAX_STRING_LENTH];					///< \~chinese  USB接口speed		\~english USB interface speed
+	char chReserved[4][WRAP_IMV_MAX_STRING_LENTH];			///< 保留							\~english Reserved field
+}WRAP_IMV_UsbInterfaceInfo;
+
+/// \~chinese
+/// \brief 设备通用信息
+/// \~english
+/// \brief Device general information
+typedef struct WRAP_IMV_DeviceInfo
+{
+	WRAP_IMV_ECameraType			nCameraType;								///< \~chinese 设备类别			\~english Camera type
+	int								nCameraReserved[5];							///< \~chinese 保留				\~english Reserved field
+
+	char							cameraKey[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese 厂商:序列号		\~english Camera key
+	char							cameraName[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese 用户自定义名		\~english UserDefinedName
+	char							serialNumber[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese 设备序列号		\~english Device SerialNumber
+	char							vendorName[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese 厂商				\~english Camera Vendor
+	char							modelName[WRAP_IMV_MAX_STRING_LENTH];			///< \~chinese 设备型号			\~english Device model
+	char							manufactureInfo[WRAP_IMV_MAX_STRING_LENTH];		///< \~chinese 设备制造信息		\~english Device ManufactureInfo
+	char							deviceVersion[WRAP_IMV_MAX_STRING_LENTH];		///< \~chinese 设备版本			\~english Device Version
+	char							cameraReserved[5][WRAP_IMV_MAX_STRING_LENTH];	///< \~chinese 保留				\~english Reserved field
+	union
+	{
+		WRAP_IMV_GigEDeviceInfo		gigeDeviceInfo;								///< \~chinese  Gige设备信息	\~english Gige Device Information
+		WRAP_IMV_UsbDeviceInfo		usbDeviceInfo;								///< \~chinese  Usb设备信息		\~english Usb  Device Information
+	}DeviceSpecificInfo;
+
+	WRAP_IMV_EInterfaceType			nInterfaceType;								///< \~chinese 接口类别			\~english Interface type
+	int								nInterfaceReserved[5];						///< \~chinese 保留				\~english Reserved field
+	char							interfaceName[WRAP_IMV_MAX_STRING_LENTH];		///< \~chinese 接口名			\~english Interface Name
+	char							interfaceReserved[5][WRAP_IMV_MAX_STRING_LENTH];	///< \~chinese 保留				\~english Reserved field
+	union
+	{
+		WRAP_IMV_GigEInterfaceInfo		gigeInterfaceInfo;							///< \~chinese  GigE网卡信息	\~english Gige interface Information
+		WRAP_IMV_UsbInterfaceInfo		usbInterfaceInfo;							///< \~chinese  Usb接口信息		\~english Usb interface Information
+	}InterfaceInfo;
+}WRAP_IMV_DeviceInfo;
+
+/// \~chinese
+/// \brief 设备信息列表
+/// \~english
+/// \brief Device information list
+typedef struct WRAP_IMV_DeviceList
+{
+	unsigned int		nDevNum;					///< \~chinese 设备数量									\~english Device Number
+	WRAP_IMV_DeviceInfo*		pDevInfo;					///< \~chinese 设备息列表(SDK内部缓存)，最多100设备		\~english Device information list(cached within the SDK), up to 100
+}WRAP_IMV_DeviceList;
+
+/// \~chinese
+/// \brief 帧图像信息
+/// \~english
+/// \brief The frame image information
+typedef struct WRAP_IMV_FrameInfo
+{
+	uint64_t				blockId;				///< \~chinese 帧Id(仅对GigE/Usb/PCIe相机有效)					\~english The block ID(GigE/Usb/PCIe camera only)
+	unsigned int			status;					///< \~chinese 数据帧状态(0是正常状态)							\~english The status of frame(0 is normal status)
+	unsigned int			width;					///< \~chinese 图像宽度											\~english The width of image
+	unsigned int			height;					///< \~chinese 图像高度											\~english The height of image
+	unsigned int			size;					///< \~chinese 图像大小											\~english The size of image
+	WRAP_IMV_EPixelType		pixelFormat;			///< \~chinese 图像像素格式										\~english The pixel format of image
+	uint64_t				timeStamp;				///< \~chinese 图像时间戳(仅对GigE/Usb/PCIe相机有效)			\~english The timestamp of image(GigE/Usb/PCIe camera only)
+	unsigned int			chunkCount;				///< \~chinese 帧数据中包含的Chunk个数(仅对GigE/Usb相机有效)	\~english The number of chunk in frame data(GigE/Usb Camera Only)
+	unsigned int			paddingX;				///< \~chinese 图像paddingX(仅对GigE/Usb/PCIe相机有效)			\~english The paddingX of image(GigE/Usb/PCIe camera only)
+	unsigned int			paddingY;				///< \~chinese 图像paddingY(仅对GigE/Usb/PCIe相机有效)			\~english The paddingY of image(GigE/Usb/PCIe camera only)
+	unsigned int			recvFrameTime;			///< \~chinese 图像在网络传输所用的时间(单位:微秒,非GigE相机该值为0)	\~english The time taken for the image to be transmitted over the network(unit:us, The value is 0 for non-GigE camera)
+	unsigned int			nReserved[19];			///< \~chinese 预留字段											\~english Reserved field
+}WRAP_IMV_FrameInfo;
+
+/// \~chinese
+/// \brief 帧图像数据信息
+/// \~english
+/// \brief Frame image data information
+typedef struct WRAP_IMV_Frame
+{
+	WRAP_IMV_FRAME_HANDLE		frameHandle;			///< \~chinese 帧图像句柄(SDK内部帧管理用)						\~english Frame image handle(used for managing frame within the SDK)
+	unsigned char*			pData;					///< \~chinese 帧图像数据的内存首地址							\~english The starting address of memory of image data
+	WRAP_IMV_FrameInfo			frameInfo;				///< \~chinese 帧信息											\~english Frame information
+	unsigned int			nReserved[10];			///< \~chinese 预留字段											\~english Reserved field
+}WRAP_IMV_Frame;
+
+
+#ifndef WINAPI
+#ifdef __GNUC__
+#define WINAPI __attribute__((ms_abi))
+#else
+#define WINAPI __stdcall
+#endif
+#endif
+// Windows回调类型（MSABI调用约定）
+typedef void (WINAPI *WRAP_IMV_FrameCallBack)(
+    WRAP_IMV_Frame* pFrame,
+    void* pUser
+);
+
+#if defined(__cplusplus)
+extern "C"
+{
+#endif
+
+     int WRAP_IMV_CALL WRAP_IMV_EnumDevices(OUT WRAP_IMV_DeviceList *pDeviceList, IN unsigned int interfaceType);
+     int WRAP_IMV_CALL WRAP_IMV_CreateHandle(OUT WRAP_IMV_HANDLE* handle, IN WRAP_IMV_ECreateHandleMode mode, IN void* pIdentifier);
+     int WRAP_IMV_CALL WRAP_IMV_DestroyHandle(IN WRAP_IMV_HANDLE handle);
+     int WRAP_IMV_CALL WRAP_IMV_OpenEx(IN WRAP_IMV_HANDLE handle, IN WRAP_IMV_ECameraAccessPermission accessPermission);
+     int WRAP_IMV_CALL WRAP_IMV_Close(IN WRAP_IMV_HANDLE handle);
+     bool WRAP_IMV_CALL WRAP_IMV_FeatureIsWriteable(IN WRAP_IMV_HANDLE handle, IN const char* pFeatureName);
+     int WRAP_IMV_CALL WRAP_IMV_SetIntFeatureValue(IN WRAP_IMV_HANDLE handle, IN const char* pFeatureName, IN int64_t intValue);
+     int WRAP_IMV_CALL WRAP_IMV_GetIntFeatureValue(IN WRAP_IMV_HANDLE handle, IN const char* pFeatureName, OUT int64_t* pIntValue);
+     int WRAP_IMV_CALL WRAP_IMV_GetIntFeatureMax(IN WRAP_IMV_HANDLE handle, IN const char* pFeatureName, OUT int64_t* pIntValue);
+     int WRAP_IMV_CALL WRAP_IMV_GetIntFeatureMin(IN WRAP_IMV_HANDLE handle, IN const char *pFeatureName, OUT int64_t *pIntValue);
+     int WRAP_IMV_CALL WRAP_IMV_GetIntFeatureInc(IN WRAP_IMV_HANDLE handle, IN const char *pFeatureName, OUT int64_t *pIntValue);
+     int WRAP_IMV_CALL WRAP_IMV_SetDoubleFeatureValue(IN WRAP_IMV_HANDLE handle, IN const char *pFeatureName, IN double doubleValue);
+     int WRAP_IMV_CALL WRAP_IMV_GetDoubleFeatureValue(IN WRAP_IMV_HANDLE handle, IN const char *pFeatureName, OUT double *pDoubleValue);
+     int WRAP_IMV_CALL WRAP_IMV_GetDoubleFeatureMax(IN WRAP_IMV_HANDLE handle, IN const char *pFeatureName, OUT double *pDoubleValue);
+     int WRAP_IMV_CALL WRAP_IMV_GetDoubleFeatureMin(IN WRAP_IMV_HANDLE handle, IN const char *pFeatureName, OUT double *pDoubleValue);
+     int WRAP_IMV_CALL WRAP_IMV_SetEnumFeatureValue(IN WRAP_IMV_HANDLE handle, IN const char *pFeatureName, IN uint64_t enumValue);
+     int WRAP_IMV_CALL WRAP_IMV_GetEnumFeatureValue(IN WRAP_IMV_HANDLE handle, IN const char *pFeatureName, OUT uint64_t *pEnumValue);
+     int WRAP_IMV_CALL WRAP_IMV_ExecuteCommandFeature(IN WRAP_IMV_HANDLE handle, IN const char *pFeatureName);
+     int WRAP_IMV_CALL WRAP_IMV_StartGrabbing(IN WRAP_IMV_HANDLE handle);
+     int WRAP_IMV_CALL WRAP_IMV_StopGrabbing(IN WRAP_IMV_HANDLE handle);
+     int WRAP_IMV_CALL WRAP_IMV_AttachGrabbing(IN WRAP_IMV_HANDLE handle, IN WRAP_IMV_FrameCallBack proc, IN void *pUser);
+     int WRAP_IMV_CALL WRAP_IMV_GetFrame(IN WRAP_IMV_HANDLE handle, OUT WRAP_IMV_Frame *pFrame, IN unsigned int timeoutMS);
+     int WRAP_IMV_CALL WRAP_IMV_ReleaseFrame(IN WRAP_IMV_HANDLE handle, IN WRAP_IMV_Frame *pFrame);
+
+#if defined(__cplusplus)
+}
+#endif
+#endif // WRAPMV_H
+```
+
+```C
+// WrapMV.c
+#include "WrapMV.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dlfcn.h>
+#include <stdatomic.h>
+#include <pthread.h>
+#include <time.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <time.h>
+#ifdef __WINE__
+#include <windows.h>
+#endif
+
+// ==================== SDK函数指针定义 ====================
+typedef const char* (*IMV_GetVersion_t)();
+typedef int (*IMV_EnumDevices_t)(WRAP_IMV_DeviceList*, unsigned int);
+typedef int (*IMV_CreateHandle_t)(void**, int, void*);
+typedef int (*IMV_DestroyHandle_t)(void*);
+typedef int (*IMV_OpenEx_t)(void*, int);
+typedef int (*IMV_Close_t)(void*);
+typedef int (*IMV_StartGrabbing_t)(void*);
+typedef int (*IMV_StopGrabbing_t)(void*);
+typedef int (*IMV_GetFrame_t)(void*, WRAP_IMV_Frame*, unsigned int);
+typedef int (*IMV_ReleaseFrame_t)(void*, WRAP_IMV_Frame*);
+typedef int (*IMV_AttachGrabbing_t)(void*, void*, void*);
+typedef int (*IMV_SetIntFeatureValue_t)(void*, const char*, int64_t);
+typedef int (*IMV_GetIntFeatureValue_t)(void*, const char*, int64_t*);
+typedef int (*IMV_GetIntFeatureMax_t)(void*, const char*, int64_t*);
+typedef int (*IMV_GetIntFeatureMin_t)(void*, const char*, int64_t*);
+typedef int (*IMV_GetIntFeatureInc_t)(void*, const char*, int64_t*);
+typedef int (*IMV_SetDoubleFeatureValue_t)(void*, const char*, double);
+typedef int (*IMV_GetDoubleFeatureValue_t)(void*, const char*, double*);
+typedef int (*IMV_GetDoubleFeatureMax_t)(void*, const char*, double*);
+typedef int (*IMV_GetDoubleFeatureMin_t)(void*, const char*, double*);
+typedef int (*IMV_SetEnumFeatureValue_t)(void*, const char*, uint64_t);
+typedef int (*IMV_GetEnumFeatureValue_t)(void*, const char*, uint64_t*);
+typedef int (*IMV_ExecuteCommandFeature_t)(void*, const char*);
+typedef int (*IMV_FeatureIsWriteable_t)(void*, const char*);
+
+// ==================== 全局变量 ====================
+static void* sdk_handle = NULL;
+static atomic_bool sdk_loaded = ATOMIC_VAR_INIT(0);
+static WRAP_IMV_FrameCallBack user_callback = NULL;
+
+// SDK函数指针
+static IMV_GetVersion_t pIMV_GetVersion = NULL;
+static IMV_EnumDevices_t pIMV_EnumDevices = NULL;
+static IMV_CreateHandle_t pIMV_CreateHandle = NULL;
+static IMV_DestroyHandle_t pIMV_DestroyHandle = NULL;
+static IMV_OpenEx_t pIMV_OpenEx = NULL;
+static IMV_Close_t pIMV_Close = NULL;
+static IMV_StartGrabbing_t pIMV_StartGrabbing = NULL;
+static IMV_StopGrabbing_t pIMV_StopGrabbing = NULL;
+static IMV_GetFrame_t pIMV_GetFrame = NULL;
+static IMV_ReleaseFrame_t pIMV_ReleaseFrame = NULL;
+static IMV_AttachGrabbing_t pIMV_AttachGrabbing = NULL;
+static IMV_SetIntFeatureValue_t pIMV_SetIntFeatureValue = NULL;
+static IMV_GetIntFeatureValue_t pIMV_GetIntFeatureValue = NULL;
+static IMV_GetIntFeatureMax_t pIMV_GetIntFeatureMax = NULL;
+static IMV_GetIntFeatureMin_t pIMV_GetIntFeatureMin = NULL;
+static IMV_GetIntFeatureInc_t pIMV_GetIntFeatureInc = NULL;
+static IMV_SetDoubleFeatureValue_t pIMV_SetDoubleFeatureValue = NULL;
+static IMV_GetDoubleFeatureValue_t pIMV_GetDoubleFeatureValue = NULL;
+static IMV_GetDoubleFeatureMax_t pIMV_GetDoubleFeatureMax = NULL;
+static IMV_GetDoubleFeatureMin_t pIMV_GetDoubleFeatureMin = NULL;
+static IMV_SetEnumFeatureValue_t pIMV_SetEnumFeatureValue = NULL;
+static IMV_GetEnumFeatureValue_t pIMV_GetEnumFeatureValue = NULL;
+static IMV_ExecuteCommandFeature_t pIMV_ExecuteCommandFeature = NULL;
+static IMV_FeatureIsWriteable_t pIMV_FeatureIsWriteable = NULL;
+
+// ==================== 调试宏 ====================
+// #define DEBUG_ENABLED 1
+#ifdef DEBUG_ENABLED
+    #define DEBUG_LOG(fmt, ...) printf("[WRAPMV] " fmt "\n", ##__VA_ARGS__)
+#else
+    #define DEBUG_LOG(fmt, ...)
+#endif
+
+#ifdef __WINE__
+// DLL入口点（仅Wine环境需要）
+BOOL WRAP_IMV_CALL DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID reserved)
+{
+    (void)hinstDLL;
+    (void)reserved;
+    
+    if (reason == DLL_PROCESS_ATTACH) {
+        DEBUG_LOG("DLL loaded (Wine environment)");
+    } else if (reason == DLL_PROCESS_DETACH) {
+        DEBUG_LOG("DLL unloaded (Wine environment)");
+    }
+    
+    return TRUE;
+}
+#endif
+
+// ==================== 回调线程核心数据结构定义 ====================
+#define MAX_CAMERAS 10                   // 相机最大数量
+#define QUEUE_FULL_TIMEOUT_NS 10000000   // 10ms，队列满超时（纳秒）
+#define STAT_PRINT_INTERVAL 5            // 统计打印间隔（秒）
+
+typedef struct {
+    WRAP_IMV_Frame* frames;      // 帧数组
+    int capacity;                // 队列容量
+    int head;                    // 队列头（读位置）
+    int tail;                    // 队列尾（写位置）
+    int count;                   // 当前帧数
+    atomic_int dropped_frames;   // 丢帧计数（统计用）
+} FrameQueue;
+
+// 相机上下文：句柄、回调、注册数据、图像数据、线程id
+typedef struct {
+    WRAP_IMV_HANDLE handle;            // SDK句柄
+    WRAP_IMV_FrameCallBack callback;   // 用户回调函数
+    void* user_data;                   // 用户数据
+    atomic_bool active;                // 是否激活
+    
+    // 帧队列
+    FrameQueue queue;                  // 帧队列
+    pthread_mutex_t queue_mutex;       // 队列锁
+    pthread_cond_t queue_not_empty;    // 队列非空条件
+    pthread_cond_t queue_not_full;     // 队列非满条件
+    
+    // 处理线程
+    #ifdef __WINE__
+    HANDLE thread_handle;
+    #else
+    pthread_t thread_id;
+    #endif
+    atomic_bool thread_exit;
+    
+    // 统计信息
+    atomic_long frames_processed;      // 已处理帧数
+    atomic_long frames_received;       // 接收帧数
+} CameraContext;
+
+// 相机上下文队列
+static CameraContext* camera_contexts[10] = {0};
+
+// 相机上下文队列所线程锁
+static pthread_rwlock_t camera_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+
+static atomic_long frames_received = ATOMIC_VAR_INIT(0);  // SDK回调中使用的统计变量
+
+// ==================== 队列操作函数 ====================
+static int FrameQueue_Init(FrameQueue* queue, int capacity) 
+{
+    queue->frames = (WRAP_IMV_Frame*)calloc(capacity, sizeof(WRAP_IMV_Frame));
+    if (!queue->frames) 
+    {
+        DEBUG_LOG("错误: 无法分配帧队列内存");
+        return 0;
+    }
+    
+    queue->capacity = capacity;
+    queue->head = 0;
+    queue->tail = 0;
+    queue->count = 0;
+    atomic_store(&queue->dropped_frames, 0);
+    
+    DEBUG_LOG("帧队列初始化: 容量=%d", capacity);
+    return 1;
+}
+
+static void FrameQueue_Destroy(FrameQueue* queue) 
+{
+    if (queue->frames) {
+        // 释放所有帧的数据
+        for (int i = 0; i < queue->capacity; i++) 
+        {
+            if (queue->frames[i].pData) 
+            {
+                free(queue->frames[i].pData);
+                queue->frames[i].pData = NULL;
+            }
+        }
+        free(queue->frames);
+        queue->frames = NULL;
+    }
+    queue->capacity = 0;
+    queue->head = 0;
+    queue->tail = 0;
+    queue->count = 0;
+}
+
+// 入队（非阻塞，队列满时返回0）
+static int FrameQueue_Push(FrameQueue* queue, const WRAP_IMV_Frame* frame) 
+{
+    if (queue->count >= queue->capacity) 
+    {
+        atomic_fetch_add(&queue->dropped_frames, 1);
+        return 0; // 队列满
+    }
+    
+    WRAP_IMV_Frame* dst = &queue->frames[queue->tail];
+    
+    // 分配或重新分配数据缓冲区
+    if (dst->pData == NULL || dst->frameInfo.size < frame->frameInfo.size) 
+    {
+        if (dst->pData) 
+        {
+            free(dst->pData);
+        }
+        dst->pData = (unsigned char*)malloc(frame->frameInfo.size);
+        if (!dst->pData) 
+        {
+            DEBUG_LOG("错误: 无法分配帧数据内存");
+            return 0;
+        }
+    }
+    
+    // 拷贝帧数据
+    memcpy(dst->pData, frame->pData, frame->frameInfo.size);
+    dst->frameInfo = frame->frameInfo;
+    dst->frameHandle = frame->frameHandle;
+    
+    // 更新队列指针
+    queue->tail = (queue->tail + 1) % queue->capacity;
+    queue->count++;
+    
+    return 1;
+}
+
+// 出队（非阻塞，队列空时返回0）
+static int FrameQueue_Pop(FrameQueue* queue, WRAP_IMV_Frame* frame) 
+{
+    if (queue->count <= 0) 
+    {
+        return 0; // 队列空
+    }
+    
+    WRAP_IMV_Frame* src = &queue->frames[queue->head];
+    
+    // 拷贝帧数据（仅拷贝元数据，数据指针保持有效）
+    frame->pData = src->pData;
+    frame->frameInfo = src->frameInfo;
+    frame->frameHandle = src->frameHandle;
+    
+    // 清除源帧的指针（防止重复释放）
+    src->pData = NULL;
+    
+    // 更新队列指针
+    queue->head = (queue->head + 1) % queue->capacity;
+    queue->count--;
+    
+    return 1;
+}
+
+// 获取队列状态
+static int FrameQueue_IsFull(const FrameQueue* queue) 
+{
+    return queue->count >= queue->capacity;
+}
+
+static int FrameQueue_IsEmpty(const FrameQueue* queue) 
+{
+    return queue->count <= 0;
+}
+
+void SDK_FrameCallback(void* pFrame, void* pUser) 
+{
+    #ifdef __WINE__
+    DWORD start_ms = GetTickCount();
+    #endif
+    WRAP_IMV_Frame* frame = (WRAP_IMV_Frame*)pFrame;
+    WRAP_IMV_HANDLE handle = (WRAP_IMV_HANDLE)pUser;
+    
+    if (!frame || !frame->pData || frame->frameInfo.size == 0) 
+    {
+        DEBUG_LOG("收到无效帧\n"); 
+        return;
+    }
+    
+    // 统计接收帧数
+    atomic_fetch_add(&frames_received, 1);
+    
+    // 通过handle找到相机上下文
+    pthread_rwlock_rdlock(&camera_rwlock);
+    CameraContext* ctx = NULL;
+    for (int i = 0; i < MAX_CAMERAS; i++) 
+    {
+        if (camera_contexts[i] && 
+            camera_contexts[i]->handle == handle &&
+            atomic_load(&camera_contexts[i]->active)) 
+        {
+            ctx = camera_contexts[i];
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&camera_rwlock);
+    
+    if (!ctx || !ctx->callback) 
+    {
+        DEBUG_LOG("该回调未注册\n"); 
+        return;
+    }
+    
+    pthread_mutex_lock(&ctx->queue_mutex);
+    
+    // 如果队列满，等待处理线程消费
+    while (FrameQueue_IsFull(&ctx->queue) && 
+           !atomic_load(&ctx->thread_exit)) 
+    {
+        // 通知处理线程加速处理
+        pthread_cond_signal(&ctx->queue_not_empty);
+        
+        // 等待队列有空位（带超时，避免死锁）
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 10 * 1000000; // 10ms超时
+        if (ts.tv_nsec >= 1000000000) 
+        {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000;
+        }
+        
+        int wait_result = pthread_cond_timedwait(&ctx->queue_not_full, 
+                                                &ctx->queue_mutex, &ts);
+        if (wait_result == ETIMEDOUT) 
+        {
+            // 超时，丢弃此帧
+            DEBUG_LOG("警告: 队列满，丢弃帧 (大小: %u)", frame->frameInfo.size);
+            pthread_mutex_unlock(&ctx->queue_mutex);
+            return;
+        }
+    }
+    
+    // 帧入队
+    if (FrameQueue_Push(&ctx->queue, frame)) {
+        DEBUG_LOG("帧入队: 队列大小=%d/%d, width=%d, height=%d", 
+                 ctx->queue.count, ctx->queue.capacity,
+                 frame->frameInfo.width, frame->frameInfo.height);
+        
+        // 通知处理线程
+        pthread_cond_signal(&ctx->queue_not_empty);
+    } else {
+        DEBUG_LOG("错误: 帧入队失败");
+    }
+    
+    pthread_mutex_unlock(&ctx->queue_mutex);
+    #ifdef __WINE__
+    DWORD end_ms = GetTickCount();
+    DEBUG_LOG("包装回调耗时：%lu ms\n", end_ms - start_ms);
+    #endif
+}
+
+// ==================== Wine处理线程 ====================
+// 保存为BMP图片（最简单）
+void SaveAsBMP(unsigned char* pData, int width, int height, const char* filename) {
+    // 1. 创建文件
+    FILE* file = fopen(filename, "wb");
+    
+    // 2. 写入BMP文件头（54字节）和数据
+    unsigned char header[54] = {
+        0x42, 0x4D,           // "BM"
+        0,0,0,0,              // 文件大小（稍后计算）
+        0,0,0,0,              // 保留
+        54,0,0,0,             // 数据偏移
+        40,0,0,0,             // 信息头大小
+        width & 0xFF, (width >> 8) & 0xFF, (width >> 16) & 0xFF, (width >> 24) & 0xFF, // 宽度
+        height & 0xFF, (height >> 8) & 0xFF, (height >> 16) & 0xFF, (height >> 24) & 0xFF, // 高度
+        1,0,                  // 平面数
+        24,0,                 // 每像素位数
+        0,0,0,0,              // 压缩方式
+        0,0,0,0,              // 图像大小
+        0,0,0,0,              // 水平分辨率
+        0,0,0,0,              // 垂直分辨率
+        0,0,0,0,              // 颜色数
+        0,0,0,0               // 重要颜色数
+    };
+    
+    int rowSize = ((width * 3 + 3) / 4) * 4;  // BMP要求每行4字节对齐
+    int fileSize = 54 + rowSize * height;
+    
+    // 更新文件大小
+    header[2] = fileSize & 0xFF;
+    header[3] = (fileSize >> 8) & 0xFF;
+    header[4] = (fileSize >> 16) & 0xFF;
+    header[5] = (fileSize >> 24) & 0xFF;
+    
+    // 写入文件头
+    fwrite(header, 1, 54, file);
+    
+    // 3. 写入图像数据（需要将单通道转为RGB）
+    unsigned char* rgbData = (unsigned char*)malloc(rowSize);
+    
+    for (int y = height - 1; y >= 0; y--) {  // BMP是倒着存的
+        for (int x = 0; x < width; x++) {
+            unsigned char gray = pData[y * width + x];
+            rgbData[x * 3 + 0] = gray;  // B
+            rgbData[x * 3 + 1] = gray;  // G  
+            rgbData[x * 3 + 2] = gray;  // R
+        }
+        // 填充对齐字节
+        for (int x = width * 3; x < rowSize; x++) {
+            rgbData[x] = 0;
+        }
+        fwrite(rgbData, 1, rowSize, file);
+    }
+    
+    free(rgbData);
+    fclose(file);
+}
+
+#ifdef __WINE__
+DWORD WINAPI CameraProcessor(LPVOID param) {
+#else
+void* CameraProcessor(void* param) {
+#endif
+    CameraContext* ctx = (CameraContext*)param;
+    
+    #ifdef __WINE__
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    #endif
+    
+    // 线程局部帧缓冲区（避免在队列中持有锁）
+    WRAP_IMV_Frame local_frame;
+    memset(&local_frame, 0, sizeof(local_frame));
+    
+    while (!atomic_load(&ctx->thread_exit)) 
+    {
+        pthread_mutex_lock(&ctx->queue_mutex);
+        
+        // 等待队列中有帧
+        while (FrameQueue_IsEmpty(&ctx->queue) && 
+               !atomic_load(&ctx->thread_exit)) 
+        {
+            // 解锁queue_mutex，等待队列非空信号，再加锁queue_mutex
+            pthread_cond_wait(&ctx->queue_not_empty, &ctx->queue_mutex);
+        }
+        
+        if (atomic_load(&ctx->thread_exit)) 
+        {
+            pthread_mutex_unlock(&ctx->queue_mutex);
+            break;
+        }
+        
+        // 从队列中取出一帧
+        if (!FrameQueue_Pop(&ctx->queue, &local_frame)) 
+        {
+            pthread_mutex_unlock(&ctx->queue_mutex);
+            continue;
+        }
+        
+        // 通知SDK回调可以继续（队列有空位）
+        pthread_cond_signal(&ctx->queue_not_full);
+        pthread_mutex_unlock(&ctx->queue_mutex);
+
+        #ifdef __WINE__
+        DWORD start_ms = GetTickCount();
+        #endif
+
+        // 调用用户回调（不在锁内执行）
+        if (ctx->callback) 
+        {
+            ctx->callback(&local_frame, ctx->user_data);
+        }
+        
+        #ifdef __WINE__
+        DWORD end_ms = GetTickCount();
+        DEBUG_LOG("Windows回调耗时：%lu ms\n", end_ms - start_ms);
+        #endif
+
+        // 释放帧数据内存
+        if (local_frame.pData) 
+        {
+            free(local_frame.pData);
+            local_frame.pData = NULL;
+        }
+        
+        // 统计处理帧数
+        atomic_fetch_add(&ctx->frames_processed, 1);
+        
+        // 定期打印统计信息（每秒一次）
+        static time_t last_stat_time = 0;
+        time_t now = time(NULL);
+        if (now != last_stat_time) 
+        {
+            long received = atomic_load(&ctx->frames_received);
+            long processed = atomic_load(&ctx->frames_processed);
+            int queue_size = ctx->queue.count;
+            int dropped = atomic_load(&ctx->queue.dropped_frames);
+            
+            if (now % 5 == 0) { // 每5秒打印一次
+                DEBUG_LOG("统计[%p]: 接收=%ld, 处理=%ld, 队列=%d, 丢弃=%d",
+                         ctx->handle, received, processed, queue_size, dropped);
+            }
+            last_stat_time = now;
+        }
+        
+        #ifdef __WINE__
+        Sleep(0); // 让出时间片
+        #endif
+    }
+    
+    // 清理本地缓冲区
+    if (local_frame.pData) {
+        free(local_frame.pData);
+    }
+    
+    return 0;
+}
+
+// ==================== SDK动态加载 ====================
+static int LoadSDK() {
+    if (atomic_load(&sdk_loaded)) {
+        return 1;
+    }
+    
+    DEBUG_LOG("加载相机SDK...");
+    
+    // 尝试加载libMVSDK.so
+    sdk_handle = dlopen("libMVSDK.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!sdk_handle) {
+        DEBUG_LOG("加载失败: %s", dlerror());
+        return 0;
+    }
+    
+    DEBUG_LOG("成功加载SDK库");
+    
+    // 加载所有函数
+    #define LOAD_FUNC(name) \
+        do { \
+            pIMV_##name = (IMV_##name##_t)dlsym(sdk_handle, "IMV_" #name); \
+            if (!pIMV_##name) { \
+                DEBUG_LOG("警告: 找不到函数 IMV_" #name " - %s", dlerror()); \
+            } else { \
+                DEBUG_LOG("✓ 加载函数: IMV_" #name); \
+            } \
+        } while(0)
+    
+    LOAD_FUNC(GetVersion);
+    LOAD_FUNC(EnumDevices);
+    LOAD_FUNC(CreateHandle);
+    LOAD_FUNC(DestroyHandle);
+    LOAD_FUNC(OpenEx);
+    LOAD_FUNC(Close);
+    LOAD_FUNC(StartGrabbing);
+    LOAD_FUNC(StopGrabbing);
+    LOAD_FUNC(GetFrame);
+    LOAD_FUNC(ReleaseFrame);
+    LOAD_FUNC(AttachGrabbing);
+    LOAD_FUNC(SetIntFeatureValue);
+    LOAD_FUNC(GetIntFeatureValue);
+    LOAD_FUNC(GetIntFeatureMax);
+    LOAD_FUNC(GetIntFeatureMin);
+    LOAD_FUNC(GetIntFeatureInc);
+    LOAD_FUNC(SetDoubleFeatureValue);
+    LOAD_FUNC(GetDoubleFeatureValue);
+    LOAD_FUNC(GetDoubleFeatureMax);
+    LOAD_FUNC(GetDoubleFeatureMin);
+    LOAD_FUNC(SetEnumFeatureValue);
+    LOAD_FUNC(GetEnumFeatureValue);
+    LOAD_FUNC(ExecuteCommandFeature);
+    LOAD_FUNC(FeatureIsWriteable);
+    
+    #undef LOAD_FUNC
+    
+    // 测试版本获取
+    if (pIMV_GetVersion) {
+        const char* version = pIMV_GetVersion();
+        DEBUG_LOG("SDK版本: %s", version ? version : "未知");
+    }
+    
+    // 检查必要函数
+    if (!pIMV_EnumDevices || !pIMV_CreateHandle) {
+        DEBUG_LOG("错误: 缺少必要的SDK函数");
+        dlclose(sdk_handle);
+        sdk_handle = NULL;
+        return 0;
+    }
+    
+    atomic_store(&sdk_loaded, 1);
+    DEBUG_LOG("SDK加载完成");
+    return 1;
+}
+
+// 确保SDK加载的辅助函数
+static inline int EnsureSDKLoaded() {
+    if (!atomic_load(&sdk_loaded)) {
+        return LoadSDK();
+    }
+    return 1;
+}
+
+// ==================== API函数实现 ====================
+
+int WRAP_IMV_CALL  WRAP_IMV_EnumDevices(WRAP_IMV_DeviceList* pDeviceList, unsigned int interfaceType) {
+    if (!EnsureSDKLoaded() || !pIMV_EnumDevices) {
+        DEBUG_LOG("SDK未加载或EnumDevices函数不可用");
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_EnumDevices(pDeviceList, interfaceType);
+    DEBUG_LOG("原始SDK EnumDevices返回: %d", result);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_CreateHandle(WRAP_IMV_HANDLE* handle, WRAP_IMV_ECreateHandleMode mode, void* pIdentifier) {
+    if (!EnsureSDKLoaded() || !pIMV_CreateHandle) {
+        DEBUG_LOG("SDK未加载或CreateHandle函数不可用");
+        return WRAP_IMV_ERROR;
+    }
+    
+    DEBUG_LOG("创建句柄，模式: %d", (int)mode);
+    
+    int result = pIMV_CreateHandle(handle, (int)mode, pIdentifier);
+    DEBUG_LOG("CreateHandle返回: %d, 句柄: %p", result, handle ? *handle : NULL);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_DestroyHandle(WRAP_IMV_HANDLE handle) {
+    if (!pIMV_DestroyHandle) {
+        if (!EnsureSDKLoaded()) return WRAP_IMV_ERROR;
+        if (!pIMV_DestroyHandle) return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_DestroyHandle(handle);
+    DEBUG_LOG("DestroyHandle返回: %d", result);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_OpenEx(WRAP_IMV_HANDLE handle, WRAP_IMV_ECameraAccessPermission accessPermission) {
+    if (!EnsureSDKLoaded() || !pIMV_OpenEx) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_OpenEx(handle, (int)accessPermission);
+    DEBUG_LOG("OpenEx返回: %d", result);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_Close(WRAP_IMV_HANDLE handle) {
+    if (!pIMV_Close) {
+        if (!EnsureSDKLoaded()) return WRAP_IMV_ERROR;
+        if (!pIMV_Close) return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_Close(handle);
+    DEBUG_LOG("Close返回: %d", result);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+bool WRAP_IMV_CALL WRAP_IMV_FeatureIsWriteable(WRAP_IMV_HANDLE handle, const char* pFeatureName) {
+    if (!EnsureSDKLoaded() || !pIMV_FeatureIsWriteable) {
+        return false;
+    }
+    
+    int result = pIMV_FeatureIsWriteable(handle, pFeatureName);
+    DEBUG_LOG("FeatureIsWriteable: %s, 结果: %d", pFeatureName, result);
+    
+    return (result != 0);
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_SetIntFeatureValue(WRAP_IMV_HANDLE handle, const char* pFeatureName, int64_t intValue) {
+    if (!EnsureSDKLoaded() || !pIMV_SetIntFeatureValue) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_SetIntFeatureValue(handle, pFeatureName, intValue);
+    DEBUG_LOG("SetIntFeatureValue: %s = %lld, 结果: %d", pFeatureName, intValue, result);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_GetIntFeatureValue(WRAP_IMV_HANDLE handle, const char* pFeatureName, int64_t* pIntValue) {
+    if (!EnsureSDKLoaded() || !pIMV_GetIntFeatureValue) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_GetIntFeatureValue(handle, pFeatureName, pIntValue);
+    if (result == WRAP_IMV_OK && pIntValue) {
+        DEBUG_LOG("GetIntFeatureValue: %s = %lld, 结果: %d", pFeatureName, *pIntValue, result);
+    } else {
+        DEBUG_LOG("GetIntFeatureValue: %s, 结果: %d", pFeatureName, result);
+    }
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_GetIntFeatureMax(WRAP_IMV_HANDLE handle, const char* pFeatureName, int64_t* pIntValue) {
+    if (!EnsureSDKLoaded() || !pIMV_GetIntFeatureMax) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_GetIntFeatureMax(handle, pFeatureName, pIntValue);
+    if (result == WRAP_IMV_OK && pIntValue) {
+        DEBUG_LOG("GetIntFeatureMax: %s = %lld, 结果: %d", pFeatureName, *pIntValue, result);
+    }
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_GetIntFeatureMin(WRAP_IMV_HANDLE handle, const char* pFeatureName, int64_t* pIntValue) {
+    if (!EnsureSDKLoaded() || !pIMV_GetIntFeatureMin) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_GetIntFeatureMin(handle, pFeatureName, pIntValue);
+    if (result == WRAP_IMV_OK && pIntValue) {
+        DEBUG_LOG("GetIntFeatureMin: %s = %lld, 结果: %d", pFeatureName, *pIntValue, result);
+    }
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_GetIntFeatureInc(WRAP_IMV_HANDLE handle, const char* pFeatureName, int64_t* pIntValue) {
+    if (!EnsureSDKLoaded() || !pIMV_GetIntFeatureInc) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_GetIntFeatureInc(handle, pFeatureName, pIntValue);
+    if (result == WRAP_IMV_OK && pIntValue) {
+        DEBUG_LOG("GetIntFeatureInc: %s = %lld, 结果: %d", pFeatureName, *pIntValue, result);
+    }
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_SetDoubleFeatureValue(WRAP_IMV_HANDLE handle, const char* pFeatureName, double doubleValue) {
+    if (!EnsureSDKLoaded() || !pIMV_SetDoubleFeatureValue) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_SetDoubleFeatureValue(handle, pFeatureName, doubleValue);
+    DEBUG_LOG("SetDoubleFeatureValue: %s = %f, 结果: %d", pFeatureName, doubleValue, result);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_GetDoubleFeatureValue(WRAP_IMV_HANDLE handle, const char* pFeatureName, double* pDoubleValue) {
+    if (!EnsureSDKLoaded() || !pIMV_GetDoubleFeatureValue) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_GetDoubleFeatureValue(handle, pFeatureName, pDoubleValue);
+    if (result == WRAP_IMV_OK && pDoubleValue) {
+        DEBUG_LOG("GetDoubleFeatureValue: %s = %f, 结果: %d", pFeatureName, *pDoubleValue, result);
+    }
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_GetDoubleFeatureMax(WRAP_IMV_HANDLE handle, const char* pFeatureName, double* pDoubleValue) {
+    if (!EnsureSDKLoaded() || !pIMV_GetDoubleFeatureMax) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_GetDoubleFeatureMax(handle, pFeatureName, pDoubleValue);
+    if (result == WRAP_IMV_OK && pDoubleValue) {
+        DEBUG_LOG("GetDoubleFeatureMax: %s = %f, 结果: %d", pFeatureName, *pDoubleValue, result);
+    }
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_GetDoubleFeatureMin(WRAP_IMV_HANDLE handle, const char* pFeatureName, double* pDoubleValue) {
+    if (!EnsureSDKLoaded() || !pIMV_GetDoubleFeatureMin) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_GetDoubleFeatureMin(handle, pFeatureName, pDoubleValue);
+    if (result == WRAP_IMV_OK && pDoubleValue) {
+        DEBUG_LOG("GetDoubleFeatureMin: %s = %f, 结果: %d", pFeatureName, *pDoubleValue, result);
+    }
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_SetEnumFeatureValue(WRAP_IMV_HANDLE handle, const char* pFeatureName, uint64_t enumValue) {
+    if (!EnsureSDKLoaded() || !pIMV_SetEnumFeatureValue) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_SetEnumFeatureValue(handle, pFeatureName, enumValue);
+    DEBUG_LOG("SetEnumFeatureValue: %s = %lu, 结果: %d", pFeatureName, enumValue, result);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_GetEnumFeatureValue(WRAP_IMV_HANDLE handle, const char* pFeatureName, uint64_t* pEnumValue) {
+    if (!EnsureSDKLoaded() || !pIMV_GetEnumFeatureValue) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_GetEnumFeatureValue(handle, pFeatureName, pEnumValue);
+    if (result == WRAP_IMV_OK && pEnumValue) {
+        DEBUG_LOG("GetEnumFeatureValue: %s = %lu, 结果: %d", pFeatureName, *pEnumValue, result);
+    }
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_ExecuteCommandFeature(WRAP_IMV_HANDLE handle, const char* pFeatureName) {
+    if (!EnsureSDKLoaded() || !pIMV_ExecuteCommandFeature) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_ExecuteCommandFeature(handle, pFeatureName);
+    DEBUG_LOG("ExecuteCommandFeature: %s, 结果: %d", pFeatureName, result);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_StartGrabbing(WRAP_IMV_HANDLE handle) {
+    if (!EnsureSDKLoaded() || !pIMV_StartGrabbing) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_StartGrabbing(handle);
+    DEBUG_LOG("StartGrabbing返回: %d", result);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_StopGrabbing(WRAP_IMV_HANDLE handle) {
+    if (!pIMV_StopGrabbing) {
+        if (!EnsureSDKLoaded()) return WRAP_IMV_ERROR;
+        if (!pIMV_StopGrabbing) return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_StopGrabbing(handle);
+    DEBUG_LOG("StopGrabbing返回: %d", result);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL WRAP_IMV_AttachGrabbing(WRAP_IMV_HANDLE handle, 
+                                         WRAP_IMV_FrameCallBack proc, 
+                                         void* pUser) {
+    if (!EnsureSDKLoaded() || !pIMV_AttachGrabbing) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    DEBUG_LOG("AttachGrabbing: handle=%p, callback=%p, user_data=%p", 
+             handle, proc, pUser);
+    
+    pthread_rwlock_wrlock(&camera_rwlock);
+    
+    // 检查是否已注册
+    for (int i = 0; i < MAX_CAMERAS; i++) 
+    {
+        if (camera_contexts[i] && camera_contexts[i]->handle == handle) 
+        {
+            DEBUG_LOG("相机已注册，更新信息");
+            CameraContext* ctx = camera_contexts[i];
+            ctx->callback = proc;
+            ctx->user_data = pUser;
+            atomic_store(&ctx->active, 1);
+            pthread_rwlock_unlock(&camera_rwlock);
+            
+            int result = pIMV_AttachGrabbing(handle, SDK_FrameCallback, handle);
+            DEBUG_LOG("AttachGrabbing返回: %d", result);
+            return result;
+        }
+    }
+    
+    // 注册新相机
+    CameraContext* ctx = NULL;
+    int camera_id = -1;
+    
+    for (int i = 0; i < MAX_CAMERAS; i++) 
+    {
+        if (!camera_contexts[i]) 
+        {
+            ctx = (CameraContext*)calloc(1, sizeof(CameraContext));
+            if (!ctx) 
+            {
+                DEBUG_LOG("错误: 分配相机上下文内存失败");
+                pthread_rwlock_unlock(&camera_rwlock);
+                return WRAP_IMV_ERROR;
+            }
+            camera_contexts[i] = ctx;
+            camera_id = i;
+            break;
+        }
+    }
+    
+    if (!ctx) 
+    {
+        DEBUG_LOG("错误: 达到最大相机数量限制");
+        pthread_rwlock_unlock(&camera_rwlock);
+        return WRAP_IMV_ERROR;
+    }
+    
+    // 初始化队列（容量根据帧率设置，这里使用10帧）
+    #define QUEUE_CAPACITY 10
+    
+    if (!FrameQueue_Init(&ctx->queue, QUEUE_CAPACITY)) 
+    {
+        free(ctx);
+        camera_contexts[camera_id] = NULL;
+        pthread_rwlock_unlock(&camera_rwlock);
+        return WRAP_IMV_ERROR;
+    }
+    
+    // 初始化上下文
+    ctx->handle = handle;
+    ctx->callback = proc;
+    ctx->user_data = pUser;
+    atomic_store(&ctx->active, 1);
+    atomic_store(&ctx->thread_exit, 0);
+    atomic_store(&ctx->frames_processed, 0);
+    atomic_store(&ctx->frames_received, 0);
+    
+    pthread_mutex_init(&ctx->queue_mutex, NULL);
+    pthread_cond_init(&ctx->queue_not_empty, NULL);
+    pthread_cond_init(&ctx->queue_not_full, NULL);
+    
+    // 启动处理线程
+    #ifdef __WINE__
+    DWORD thread_id;
+    ctx->thread_handle = CreateThread(
+        NULL,
+        0,
+        CameraProcessor,
+        ctx,
+        0,
+        &thread_id
+    );
+    
+    if (!ctx->thread_handle) 
+    {
+        DEBUG_LOG("错误: 无法创建处理器线程");
+        FrameQueue_Destroy(&ctx->queue);
+        pthread_cond_destroy(&ctx->queue_not_empty);
+        pthread_cond_destroy(&ctx->queue_not_full);
+        pthread_mutex_destroy(&ctx->queue_mutex);
+        free(ctx);
+        camera_contexts[camera_id] = NULL;
+        pthread_rwlock_unlock(&camera_rwlock);
+        return WRAP_IMV_ERROR;
+    }
+    #else
+    if (pthread_create(&ctx->thread_id, NULL, CameraProcessor, ctx) != 0) 
+    {
+        DEBUG_LOG("错误: 无法创建处理器线程");
+        FrameQueue_Destroy(&ctx->queue);
+        pthread_cond_destroy(&ctx->queue_not_empty);
+        pthread_cond_destroy(&ctx->queue_not_full);
+        pthread_mutex_destroy(&ctx->queue_mutex);
+        free(ctx);
+        camera_contexts[camera_id] = NULL;
+        pthread_rwlock_unlock(&camera_rwlock);
+        return WRAP_IMV_ERROR;
+    }
+    #endif
+    
+    pthread_rwlock_unlock(&camera_rwlock);
+    
+    // 调用SDK注册回调
+    int result = pIMV_AttachGrabbing(handle, SDK_FrameCallback, handle);
+    DEBUG_LOG("AttachGrabbing返回: %d", result);
+    
+    return result;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_GetFrame(WRAP_IMV_HANDLE handle, WRAP_IMV_Frame* pFrame, unsigned int timeoutMS) {
+    if (!EnsureSDKLoaded() || !pIMV_GetFrame) {
+        return WRAP_IMV_ERROR;
+    }
+    
+    if (!pFrame) {
+        DEBUG_LOG("错误: pFrame为空指针");
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_GetFrame(handle, pFrame, timeoutMS);
+    DEBUG_LOG("GetFrame返回: %d, timeout=%u", result, timeoutMS);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+int WRAP_IMV_CALL  WRAP_IMV_ReleaseFrame(WRAP_IMV_HANDLE handle, WRAP_IMV_Frame* pFrame) {
+    if (!pIMV_ReleaseFrame) {
+        if (!EnsureSDKLoaded()) return WRAP_IMV_ERROR;
+        if (!pIMV_ReleaseFrame) return WRAP_IMV_ERROR;
+    }
+    
+    if (!pFrame) {
+        DEBUG_LOG("错误: pFrame为空指针");
+        return WRAP_IMV_ERROR;
+    }
+    
+    int result = pIMV_ReleaseFrame(handle, pFrame);
+    DEBUG_LOG("ReleaseFrame返回: %d", result);
+    
+    return (result == WRAP_IMV_OK) ? WRAP_IMV_OK : WRAP_IMV_ERROR;
+}
+
+// ==================== 清理函数 ====================
+
+void WRAP_IMV_Cleanup() 
+{
+    DEBUG_LOG("清理SDK资源");
+
+    pthread_rwlock_wrlock(&camera_rwlock);
+    
+    for (int i = 0; i < MAX_CAMERAS; i++) {
+        if (camera_contexts[i]) {
+            CameraContext* ctx = camera_contexts[i];
+            
+            // 停止线程
+            atomic_store(&ctx->thread_exit, 1);
+            atomic_store(&ctx->active, 0);
+            
+            // 唤醒线程以便退出
+            pthread_mutex_lock(&ctx->queue_mutex);
+            pthread_cond_broadcast(&ctx->queue_not_empty);
+            pthread_cond_broadcast(&ctx->queue_not_full);
+            pthread_mutex_unlock(&ctx->queue_mutex);
+            
+            #ifdef __WINE__
+            if (ctx->thread_handle) {
+                WaitForSingleObject(ctx->thread_handle, 1000);
+                CloseHandle(ctx->thread_handle);
+                ctx->thread_handle = NULL;
+            }
+            #else
+            if (ctx->thread_id) {
+                pthread_join(ctx->thread_id, NULL);
+                ctx->thread_id = 0;
+            }
+            #endif
+            
+            // 打印最终统计
+            DEBUG_LOG("相机[%p]统计: 接收=%ld, 处理=%ld, 丢弃=%d",
+                     ctx->handle,
+                     atomic_load(&ctx->frames_received),
+                     atomic_load(&ctx->frames_processed),
+                     atomic_load(&ctx->queue.dropped_frames));
+            
+            // 销毁队列
+            FrameQueue_Destroy(&ctx->queue);
+            
+            pthread_mutex_destroy(&ctx->queue_mutex);
+            pthread_cond_destroy(&ctx->queue_not_empty);
+            pthread_cond_destroy(&ctx->queue_not_full);
+            
+            free(ctx);
+            camera_contexts[i] = NULL;
+        }
+    }
+    
+    pthread_rwlock_unlock(&camera_rwlock);
+    pthread_rwlock_destroy(&camera_rwlock);
+    
+    if (sdk_handle) {
+        dlclose(sdk_handle);
+        sdk_handle = NULL;
+    }
+    
+    atomic_store(&sdk_loaded, 0);
+    user_callback = NULL;
+    
+    // 重置所有函数指针
+    pIMV_GetVersion = NULL;
+    pIMV_EnumDevices = NULL;
+    pIMV_CreateHandle = NULL;
+    pIMV_DestroyHandle = NULL;
+    pIMV_OpenEx = NULL;
+    pIMV_Close = NULL;
+    pIMV_StartGrabbing = NULL;
+    pIMV_StopGrabbing = NULL;
+    pIMV_GetFrame = NULL;
+    pIMV_ReleaseFrame = NULL;
+    pIMV_AttachGrabbing = NULL;
+    pIMV_SetIntFeatureValue = NULL;
+    pIMV_GetIntFeatureValue = NULL;
+    pIMV_GetIntFeatureMax = NULL;
+    pIMV_GetIntFeatureMin = NULL;
+    pIMV_GetIntFeatureInc = NULL;
+    pIMV_SetDoubleFeatureValue = NULL;
+    pIMV_GetDoubleFeatureValue = NULL;
+    pIMV_GetDoubleFeatureMax = NULL;
+    pIMV_GetDoubleFeatureMin = NULL;
+    pIMV_SetEnumFeatureValue = NULL;
+    pIMV_GetEnumFeatureValue = NULL;
+    pIMV_ExecuteCommandFeature = NULL;
+    pIMV_FeatureIsWriteable = NULL;
+    
+    DEBUG_LOG("SDK已卸载");
+}
+
+```
+
+这里我们把Wine转接层代码只留下了一层，因为WrapMV.dll.so实际上只是一个伪装成dll的so文件，本质上是使用linux x64 gcc编译器编译的x64 .so库。
+
+接下来对包装类进行编译，步骤和上一节类似：
+```linux
+#!/bin/bash
+set -e  # 出错时退出
+
+# ========== 配置区域 ==========
+PROJECT_DIR=$(pwd)
+BUILD_DIR="$PROJECT_DIR/build"
+SRC_DIR="$PROJECT_DIR/src"
+
+# 工具路径
+BOXPATH="box64"  # box64已在PATH中
+WINEGCC="/home/user/wine/wine-10.17-amd64/bin/winegcc"
+
+# x86_64 工具链
+X64_BASE="/home/user/x86-64--glibc--stable-2022.08-1/bin"
+X64_GCC="$X64_BASE/x86_64-linux-gcc"
+X64_GXX="$X64_BASE/x86_64-linux-g++"
+# ==============================
+
+# 设置正确的链接器
+echo "=== 1. 替换系统 ld ==="
+echo "当前系统 ld: $(ls -l /usr/bin/ld 2>/dev/null || echo '不存在')"
+
+sudo ln -sf "/home/user/x86-64--glibc--stable-2022.08-1/bin/x86_64-buildroot-linux-gnu-ld" /usr/bin/ld
+
+echo "=========================================="
+echo "    WrapMV 跨平台编译脚本 (ARM64 → x86-64)"
+echo "=========================================="
+
+echo "=== 2. 清理构建目录 ==="
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+
+echo "=== 3. 编译 WrapMV.dll (x86-64 Windows DLL) ==="
+echo "使用: winegcc (通过 box64)"
+
+WRAP_LOG="$BUILD_DIR/wrapmv_compile.log"
+$BOXPATH $WINEGCC -shared -m64 \
+    -o "$BUILD_DIR/WrapMV.dll.so" \
+    "$SRC_DIR/WrapMV.c" \
+    "$SRC_DIR/WrapMV.def" \
+    -I"$SRC_DIR" \
+	-ldl -lpthread
+	2>&1 | tee "$WRAP_LOG"
+
+# 重命名为 .dll
+if [ -f "$BUILD_DIR/WrapMV.dll.so" ]; then
+    echo "✅ 生成 DLL 成功"
+
+    # 创建符号链接
+    cd "$BUILD_DIR"
+    ln -sf WrapMV.dll.so WrapMV.dll
+else
+    echo "❌ 生成 DLL 失败"
+    exit 1
+fi
+
+echo "=== 4. 验证生成文件 ==="
+echo "生成的文件:"
+ls -lh "$BUILD_DIR/" | grep -E "\.(so|dll)$"
+
+echo ""
+echo "文件类型检查:"
+echo "1. WrapMV.dll:   $(file "$BUILD_DIR/WrapMV.dll" | cut -d: -f2-)"
+
+echo ""
+echo "=== 5. 恢复系统链接器 ==="
+sudo ln -sf /usr/bin/aarch64-linux-gnu-ld.bfd /usr/bin/ld
+
+echo ""
+echo "=========================================="
+echo "✅ 构建完成！"
+echo "=========================================="
+echo "生成的库文件:"
+echo "  - $BUILD_DIR/WrapMV.dll    (Windows x86-64 DLL)"
+echo ""
+echo "使用说明:"
+echo "1. 在 x86-64 Linux 上: 使用 libUnixMV.so"
+echo "2. 在 Windows 或 Wine 上: 使用 WrapMV.dll"
+echo "3. 在 ARM64 Linux + Wine + Box64 上:"
+echo "   可以通过 Wine 加载 WrapMV.dll"
+echo "=========================================="
+echo "拷贝到XTOM路径"
+cp "$BUILD_DIR/WrapMV.dll" "/home/user/.wine-xtom/drive_d/XTOM/"
+cp "$BUILD_DIR/WrapMV.dll.so" "/home/user/.wine-xtom/drive_d/XTOM/"
+cp "$BUILD_DIR/WrapMV.dll" "/home/user/.wine-xtom/drive_d/Release/"
+cp "$BUILD_DIR/WrapMV.dll.so" "/home/user/.wine-xtom/drive_d/Release/"
+
+```
+最后，在Windows平台生成WrapMV.lib文件，方法：
+> 在开始菜单中打开x64 Native Tools Command Prompt for VS 2019命令行窗口，切换到WrapMV目录下，输入指令
+> ```
+> lib.exe /def:F:\WrapMV\src\WrapMV.def /out:F:\WrapMV\src\WrapMV.lib
+> ```
+包装库的使用方法示例：
+```C++
+#include "WrapMV.h"
+#pragma	comment(lib, "WrapMV.lib")
+void xxx()
+{
+  WRAP_IMV_DeviceList m_stDevList;
+	int nRet = WRAP_IMV_EnumDevices(&m_stDevList, nTLayerType);
+}
+```
+
 ## 2.5 串口通信实现
 
 **1. 技术路线**
@@ -2065,3 +4579,6 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 ls -l /dev/usb_projector /dev/usb_hub /dev/usb_turn
 ```
 现在，我们就可以在Windows代码中指定固定的串口COM1 COM2 COM3来使用了。
+
+## 2.6 运行Windows软件
+以上转接都实现之后，就可以在wine环境运行Windows软件了，Over！
