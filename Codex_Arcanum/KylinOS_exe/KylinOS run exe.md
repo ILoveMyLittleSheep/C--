@@ -1416,7 +1416,7 @@ ENTRYPOINT ["/app/entrypoint.sh"]
   ```text
   EGL renderer used by default for OpenGL.
   ```
-  升级Wine版本后，问题解决，但是由于飞腾X100显卡对于OpenGL版本的支持较低问题导致的图形无法旋转问题，需要后续进一步解决。
+  升级Wine版本后，问题解决，但是还存在渲染颜色失败问题，需要后续进一步解决。
 
   **wine 10.17的EGL后端通过使用更现代、更标准的API，以及为ARM平台特别优化的代码路径，成功实现了硬件加速，这才是真正的解决方案。**
   ```text

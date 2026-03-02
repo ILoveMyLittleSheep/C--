@@ -1,0 +1,25 @@
+LIBRARY WrapMV.dll
+EXPORTS
+    WRAP_IMV_EnumDevices
+    WRAP_IMV_CreateHandle
+    WRAP_IMV_DestroyHandle
+    WRAP_IMV_OpenEx
+    WRAP_IMV_Close
+    WRAP_IMV_FeatureIsWriteable
+    WRAP_IMV_SetIntFeatureValue
+    WRAP_IMV_GetIntFeatureValue
+    WRAP_IMV_GetIntFeatureMax
+    WRAP_IMV_GetIntFeatureMin
+    WRAP_IMV_GetIntFeatureInc
+    WRAP_IMV_SetDoubleFeatureValue
+    WRAP_IMV_GetDoubleFeatureValue
+    WRAP_IMV_GetDoubleFeatureMax
+    WRAP_IMV_GetDoubleFeatureMin
+    WRAP_IMV_SetEnumFeatureValue
+    WRAP_IMV_GetEnumFeatureValue
+    WRAP_IMV_ExecuteCommandFeature
+    WRAP_IMV_StartGrabbing
+    WRAP_IMV_StopGrabbing
+    WRAP_IMV_AttachGrabbing
+    WRAP_IMV_GetFrame
+    WRAP_IMV_ReleaseFrame

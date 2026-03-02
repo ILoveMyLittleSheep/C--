@@ -1,0 +1,21 @@
+#!/bin/bash
+# 只运行 Windows 程序，不涉及组件安装
+export WINEARCH=win64
+export WINEPREFIX=~/.wine-start
+
+# ============ 关键：在启动Wine前设置所有必需的环境变量 ============
+# 这些变量会被Wine进程继承，GenICam库在dlopen()时就能读取到
+
+# 1. GenICam必需的环境变量
+export GENICAM_GENTL32_PATH="/opt/HuarayTech/MVviewer/lib/GenICam/bin"
+export GENICAM_GENTL64_PATH="/opt/HuarayTech/MVviewer/lib/GenICam/bin"
+export GENICAM_LOG_CONFIG_V3_0="/opt/HuarayTech/MVviewer/lib/GenICam/log/config/DefaultLogging.properties"
+
+# 2. 库搜索路径（确保能找到ARM64库）
+export BOX64_LD_LIBRARY_PATH="/opt/HuarayTech/MVviewer/lib:/opt/HuarayTech/MVviewer/lib/GenICam/bin:$BOX64_LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="/opt/HuarayTech/MVviewer/lib:/opt/HuarayTech/MVviewer/lib/GenICam/bin:$LD_LIBRARY_PATH"
+
+box64 ~/wine/wine-10.17-amd64/bin/wine "$@"
+
+
+
