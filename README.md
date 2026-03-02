@@ -9,11 +9,13 @@
 
 ## 📂 **目录结构**  
 ```  
-├── Codex_Arcanum/                      # C++目录哦
-|  ├── Codes/                           # 代码仓库  
-|  |  └── Qt/                           # Qt代码仓库
-|  |     └── SerialPortAssist/           # 串口助手（初版）
-|  └── Notes/                           # 遇到的问题和解决方法记录  
+├── Codex_Arcanum/                      # 库目录哦
+|  ├── C++/                             # C++仓库  
+|  |  ├── Codes/                        # 代码仓库  
+|  |  |  └── Qt/                        # Qt代码仓库
+|  |  |     └── SerialPortAssist/       # 串口助手（初版）
+|  |  └── Notes/                        # 遇到的问题和解决方法记录  
+|  ├── KylinOS_exe/                     # 麒麟系统 + exe 小尝试  
 └── ...                                 # 可能还会突然增加点什么  
 ```  
 
