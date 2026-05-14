@@ -1,0 +1,250 @@
+Claude Code Windows 安装完整笔记（含踩坑与解决）
+一、Windows 使用前置条件
+1.1 安装 Node.js（必需）
+Claude Code 是基于 Node.js 的 CLI 工具，需要 Node 18+（推荐 LTS 20+）。
+
+下载地址：https://nodejs.org（选择 LTS 版，如 20.x）
+
+安装：双击 .msi，一路 Next 即可
+
+验证安装（PowerShell）：
+
+powershell
+node -v
+npm -v
+正常输出版本号即成功。
+
+1.2 安装 Git（强烈推荐）
+Claude Code 会使用 Git 读取项目历史、生成 diff、提交 PR 等。
+
+下载地址：https://git-scm.com/download/win
+
+安装：一路 Next，建议在 Select Components 页面勾选 Windows Explorer integration（方便右键使用）
+
+验证安装：
+
+powershell
+git --version
+1.3 选择终端（推荐 Windows Terminal）
+终端	推荐度	说明
+Windows Terminal	⭐⭐⭐⭐⭐	微软官方，多标签、美观、GPU 加速
+PowerShell	⭐⭐⭐	系统自带，但界面较简陋
+VS Code 内置终端	⭐⭐⭐⭐	开发时很方便
+Git Bash	⭐⭐⭐	Linux 命令习惯者适用
+安装 Windows Terminal（可选但推荐）：
+
+powershell
+winget install --id Microsoft.WindowsTerminal -e
+或直接从 Microsoft Store 搜索安装。
+
+二、安装 Claude Code
+2.1 使用 npm 全局安装
+powershell
+npm install -g @anthropic-ai/claude-code
+2.2 验证安装
+powershell
+claude --version
+三、遇到的问题及解决方案
+问题 1：npm 命令无法运行（权限/执行策略错误）
+错误信息：
+
+text
+npm : 无法加载文件 G:\...\npm.ps1，因为在此系统上禁止运行脚本。
+原因：Windows PowerShell 默认执行策略为 Restricted，禁止运行 .ps1 脚本。
+
+解决方案：
+
+以管理员身份打开 PowerShell，执行：
+
+powershell
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+输入 Y 确认，重启 PowerShell 即可。
+
+问题 2：npm install 安装极慢（即使挂了代理）
+原因：npm 默认源在国外，代理配置不生效或速度慢。
+
+解决方案：切换到国内淘宝镜像源
+
+powershell
+npm config set registry https://registry.npmmirror.com
+npm config get registry   # 验证是否成功
+然后再执行安装命令，速度会明显提升。
+
+问题 3：claude 命令报错“不是有效应用程序”
+错误信息：
+
+text
+程序“claude.exe”无法运行: 指定的可执行文件不是此操作系统平台的有效应用程序。
+原因：新版本（≥2.1.114）的 Claude Code 与原生 Windows 不兼容。
+
+解决方案：安装兼容的旧版本（如 2.1.112）
+
+powershell
+# 先卸载当前版本
+npm uninstall -g @anthropic-ai/claude-code
+
+# 安装兼容版本
+npm install -g @anthropic-ai/claude-code@2.1.112
+
+# 验证
+claude --version   # 应显示 2.1.112
+问题 4：启动后提示需要 Git Bash
+提示信息：
+
+text
+Claude Code on Windows requires git-bash...
+解决方案：
+
+下载安装 Git for Windows：https://git-scm.com/downloads/win
+
+安装时选择 “Git from the command line and also from 3rd-party software”
+
+设置环境变量（可选，如果 Claude Code 自动识别失败）：
+
+变量名：CLAUDE_CODE_GIT_BASH_PATH
+
+变量值：C:\Program Files\Git\bin\bash.exe
+
+设置方法：系统属性 → 环境变量 → 新建（用户或系统变量均可）
+
+问题 5：连接 Anthropic 服务失败（网络/地域问题）
+错误信息：
+
+text
+Unable to connect to Anthropic services
+Failed to connect to api.anthropic.com: ERR_BAD_REQUEST
+原因：网络代理未正确配置，或当前 IP 所在地区不支持 Anthropic 服务。
+
+解决方案一：配置代理环境变量
+
+在启动 claude 前，先设置代理：
+
+powershell
+$env:HTTP_PROXY="http://127.0.0.1:你的代理端口"
+$env:HTTPS_PROXY="http://127.0.0.1:你的代理端口"
+claude
+常见代理端口：7890（Clash）、10809（v2ray）、2080 等，请根据你的代理软件填写。
+
+解决方案二：使用阿里云百炼模型替换（推荐国内用户）
+
+如果网络问题持续无法解决，可以改用阿里云百炼的兼容接口（详见第五节）。
+
+问题 6：启动时卡在登录引导界面
+现象：启动后不断提示登录 Anthropic 账号，无法进入交互界面。
+
+解决方案：修改配置文件跳过引导
+
+找到配置文件：C:\Users\你的用户名\.claude.json
+
+用记事本打开，在 JSON 对象中添加字段：
+
+json
+"hasCompletedOnboarding": true
+修改后保存，重新运行 claude
+
+完整示例（注意末尾逗号）：
+
+json
+{
+  "firstStartTime": "2026-04-05T04:21:41.443Z",
+  "userID": "0727756c713e13b53404fc4c5464aa47...",
+  "hasCompletedOnboarding": true
+}
+四、Git Clone 代理问题（拓展）
+如果你的 Git 也遇到类似网络问题：
+
+powershell
+fatal: unable to access 'https://github.com/...': Failed to connect to github.com port 443
+解决方案：为 Git 单独配置代理
+
+powershell
+git config --global http.proxy http://127.0.0.1:你的代理端口
+git config --global https.proxy http://127.0.0.1:你的代理端口
+验证：
+
+powershell
+git config --global --get http.proxy
+取消代理：
+
+powershell
+git config --global --unset http.proxy
+git config --global --unset https.proxy
+五、可选方案：使用阿里云百炼模型（国内免翻墙）
+如果你在国内无法稳定连接 Anthropic 官方服务，可以改用阿里云百炼提供的兼容接口。
+
+5.1 获取阿里云 API Key
+登录 阿里云百炼控制台
+
+进入【密钥管理】，创建 API Key（格式：sk-xxx）
+
+5.2 配置 Claude Code
+编辑配置文件：C:\Users\你的用户名\.claude\settings.json（如不存在则新建）
+
+json
+{
+    "env": {
+        "ANTHROPIC_AUTH_TOKEN": "你的阿里云API Key",
+        "ANTHROPIC_BASE_URL": "https://dashscope.aliyuncs.com/apps/anthropic",
+        "ANTHROPIC_MODEL": "qwen3.6-plus",
+        "ANTHROPIC_SMALL_FAST_MODEL": "qwen3.6-flash",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qwen3.6-flash",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "qwen3.6-plus",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "qwen3.6-plus",
+        "CLAUDE_CODE_SUBAGENT_MODEL": "qwen3.6-plus"
+    }
+}
+如果使用海外节点，将 ANTHROPIC_BASE_URL 改为 https://dashscope-intl.aliyuncs.com/apps/anthropic
+
+5.3 确保跳过登录引导
+与问题 6 相同，确认 ~/.claude.json 中包含 "hasCompletedOnboarding": true。
+
+5.4 启动验证
+powershell
+claude "你好，请介绍一下你自己"
+成功响应即表示配置完成。
+
+六、最终验证清单
+node -v 正常输出
+
+npm -v 正常输出
+
+git --version 正常输出
+
+npm install -g @anthropic-ai/claude-code@2.1.112 成功
+
+claude --version 显示 2.1.112
+
+已安装 Git Bash
+
+已配置 CLAUDE_CODE_GIT_BASH_PATH（如需要）
+
+已修改 ~/.claude.json 跳过登录引导
+
+已配置代理或阿里云模型，网络连通
+
+claude "hello" 能正常响应
+
+七、附：常用命令速查
+powershell
+# 安装指定版本
+npm install -g @anthropic-ai/claude-code@2.1.112
+
+# 卸载
+npm uninstall -g @anthropic-ai/claude-code
+
+# 启动交互式会话
+claude
+
+# 单次提问
+claude "你的问题"
+
+# 查看版本
+claude --version
+
+# 设置 npm 镜像源
+npm config set registry https://registry.npmmirror.com
+
+# Git 代理配置
+git config --global http.proxy http://127.0.0.1:端口
+*笔记整理时间：2026-05-15*
+适用 Claude Code 版本：2.1.112（Windows 兼容版）
